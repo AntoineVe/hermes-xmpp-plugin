@@ -1,5 +1,9 @@
 # Hermes XMPP Platform Plugin
 
+![Version](https://img.shields.io/badge/version-1.3.9-blue)
+![License](https://img.shields.io/badge/license-MIT-green)
+![Python](https://img.shields.io/badge/python-3.10%2B-blue)
+
 XMPP gateway adapter for [Hermes Agent](https://github.com/NousResearch/hermes-agent). Connects the agent to an XMPP server, routes messages, supports inbound/outbound media, OMEMO end-to-end encryption by default, and voice/audio messages via the Hermes core TTS/STT configuration.
 
 This repository IS a Hermes plugin: the plugin manifest (`plugin.yaml`), the adapter, and its dependencies live at the repository root, so Hermes installs and updates it with its own plugin commands. No checkout to maintain and nothing to run by hand.
@@ -151,6 +155,7 @@ XMPP_AVATAR_PATH="/path/to/avatar.png"
 | `XMPP_OMEMO_ALLOW_UNTRUSTED` | Auto-trust new OMEMO devices (default: true) |
 | `XMPP_AVATAR_PATH` | Path to an avatar image (optional) |
 | `XMPP_HOME_CHANNEL` | Default JID for cron / notifications. Seeded at install from the first `XMPP_ALLOWED_USERS` entry; an existing value (or one set later with `/sethome`) always wins. |
+| `XMPP_ALLOW_PRIVATE_DOWNLOADS` | Allow inbound media to be fetched from private/link-local/loopback addresses (default: false). Set `true` only if your XMPP upload service is self-hosted on a private network. |
 
 > **Home channel note:** cron delivery and restart notifications need a home target. `post_install.py` seeds `XMPP_HOME_CHANNEL` in `.env` from the first allowlisted JID so no manual step is required. If the allowlist is empty nothing is seeded; use `/sethome` in a chat with the bot, or set the variable in `.env` yourself. `/sethome` records the home channel in `config.yaml` (core Hermes behavior for every platform); the `.env` value is what post-install and the env fallback read.
 
@@ -228,7 +233,7 @@ platforms:
     avatar_path: "/path/to/avatar.png"
 ```
 
-or with `XMPP_AVATAR_PATH` in `.env`. The avatar is re-published on every connect, so change the file and restart the gateway to update it.
+or with `XMPP_AVATAR_PATH` in `.env`. On connect the adapter checks the server's current avatar and only publishes when it is missing or different, so restarting the gateway does not re-publish an unchanged avatar (or re-announce presence). Change the file and restart the gateway to update it.
 
 ## Read Receipts (Chat Markers)
 

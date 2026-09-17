@@ -1,7 +1,7 @@
 name: xmpp-platform
 label: XMPP
 kind: platform
-version: 1.3.7
+version: 1.3.9
 description: >
   XMPP gateway adapter for Hermes Agent.
   Connects to an XMPP server and relays messages between XMPP users
@@ -49,6 +49,10 @@ optional_env:
   - name: XMPP_AVATAR_PATH
     description: "Path to an image file to publish as the bot's XMPP avatar (optional)"
     prompt: "Avatar image path (optional)"
+    password: false
+  - name: XMPP_ALLOW_PRIVATE_DOWNLOADS
+    description: "Allow inbound media to be downloaded from private/link-local/loopback addresses (default: false)"
+    prompt: "Allow private-network media downloads? (true/false)"
     password: false
 install_hint: "Talk to Hermes over XMPP"
 omemo_install_hint: "pip install slixmpp-omemo"

@@ -1,9 +1,11 @@
 import asyncio
+import hashlib
 import io
-import json
+import ipaddress
 import logging
 import os
 import re
+import socket
 import uuid
 import xml.etree.ElementTree as ET
 from pathlib import Path
@@ -204,6 +206,87 @@ def _is_media_url(url: str) -> bool:
     ))
 
 
+def _log_safe_url(url: str) -> str:
+    """Return a URL safe to write to logs.
+
+    An ``aesgcm://`` URL carries its AES-256-GCM key in the URL fragment
+    (XEP-0454), and that key is the only secret protecting the uploaded
+    ciphertext. Never log it: the fragment is replaced with a marker. All
+    other URLs are returned unchanged.
+    """
+    if not url:
+        return url
+    try:
+        parsed = urlparse(url)
+    except Exception:
+        return url
+    if parsed.scheme == "aesgcm" and parsed.fragment:
+        return parsed._replace(fragment="<redacted>").geturl()
+    return url
+
+
+def _is_blocked_ssrf_url(url: str) -> bool:
+    """Return True when a URL resolves to a loopback/private/link-local/reserved address.
+
+    Inbound messages may carry arbitrary URLs; fetching them blindly turns the
+    gateway into an SSRF proxy that can reach internal hosts (cloud metadata
+    endpoints, the local network, etc.). Hostnames are resolved before the
+    range check so a name that maps to an internal address is caught too. The
+    DNS lookup is blocking, so callers run this via ``asyncio.to_thread``.
+    """
+    try:
+        hostname = urlparse(url).hostname
+    except Exception:
+        hostname = None
+    if not hostname:
+        return True
+    host = hostname.strip().strip("[]")
+
+    addresses: list[str] = []
+    try:
+        for info in socket.getaddrinfo(host, None):
+            addr = str(info[4][0])
+            if addr not in addresses:
+                addresses.append(addr)
+    except OSError:
+        addresses = []
+    if not addresses:
+        # Could not resolve by name; treat a literal IP as authoritative.
+        try:
+            addresses = [str(ipaddress.ip_address(host))]
+        except ValueError:
+            # Unresolvable hostname: let the actual fetch fail and log it.
+            return False
+
+    for addr in addresses:
+        try:
+            ip = ipaddress.ip_address(addr)
+        except ValueError:
+            continue
+        if (
+            ip.is_loopback
+            or ip.is_private
+            or ip.is_link_local
+            or ip.is_reserved
+            or ip.is_multicast
+            or ip.is_unspecified
+        ):
+            return True
+    return False
+
+
+def _media_download_blocked(url: str) -> bool:
+    """True when SSRF protection should refuse this media download.
+
+    Only plain http(s) URLs are subject to the internal-address block; an
+    operator who self-hosts their XMPP upload service on a private network can
+    opt out with ``XMPP_ALLOW_PRIVATE_DOWNLOADS=true``.
+    """
+    if _parse_bool(os.getenv("XMPP_ALLOW_PRIVATE_DOWNLOADS"), False):
+        return False
+    return _is_blocked_ssrf_url(url)
+
+
 class XMPPAdapter(BasePlatformAdapter):
     """
     XMPP Platform Adapter for Hermes.
@@ -269,12 +352,10 @@ class XMPPAdapter(BasePlatformAdapter):
         self.typing_indicator = True
         self.avatar_path = os.getenv("XMPP_AVATAR_PATH") or extra.get("avatar_path", "")
         self.home_channel = os.getenv("XMPP_HOME_CHANNEL") or extra.get("home_channel", "")
-        # Fingerprint of the last avatar we successfully published. Used to skip
-        # re-publishing an unchanged avatar on every connect/restart.
-        self._avatar_fingerprint: Optional[str] = None
 
         self._session_started_event = asyncio.Event()
         self.client: Optional[ClientXMPP] = None
+        self._roster_request: Optional[asyncio.Future] = None
         self._http = httpx.AsyncClient(timeout=300.0, follow_redirects=True)
         self._keepalive_task: Optional[asyncio.Task] = None
         self._avatar_republish_task: Optional[asyncio.Task] = None
@@ -649,6 +730,8 @@ class XMPPAdapter(BasePlatformAdapter):
         reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
+        # reply_to is accepted for base-class compatibility but unused: XMPP has
+        # no reply-threading primitive wired into this adapter's delivery path.
         logger.debug("XMPP: send() called chat_id=%s content=%r", chat_id, content[:80])
         if self.client is None:
             logger.error("XMPP: cannot send, client not connected")
@@ -895,48 +978,8 @@ class XMPPAdapter(BasePlatformAdapter):
         msg["body"] = caption if caption else url
         msg["id"] = self.client.new_id()
 
-        if url.startswith("aesgcm://"):
-            try:
-                ns_sshare = "urn:xmpp:sfs:0"
-                ns_share = "urn:xmpp:share:1"
-                ns_oob = "jabber:x:oob"
-
-                sfs = ET.Element("{" + ns_sshare + "}file-sharing")
-                file_el = ET.SubElement(sfs, "{" + ns_share + "}file")
-                ET.SubElement(file_el, "{" + ns_share + "}name").text = filename
-                ET.SubElement(file_el, "{" + ns_share + "}media-type").text = content_type
-                ET.SubElement(file_el, "{" + ns_share + "}size").text = str(len(audio_bytes))
-
-                sources = ET.SubElement(sfs, "{" + ns_sshare + "}sources")
-                ref = ET.SubElement(sources, "{" + ns_sshare + "}reference")
-                ref.set("type", "http")
-                ref.set("url", url)
-
-                data_el = ET.SubElement(sfs, "{" + ns_oob + "}data")
-                data_el.set("url", url)
-
-                msg.xml.append(sfs)
-            except Exception as exc:
-                logger.debug("XMPP: could not attach media-sharing metadata: %s", exc)
-
-        omemo = self._omemo_plugin()
-        if omemo is not None and self.omemo_enabled:
-            try:
-                encrypted, _errors = await omemo.encrypt_message(
-                    msg,
-                    recipient_jids={recipient},
-                    identifier=str(recipient),
-                )
-                if encrypted:
-                    encrypted.send()
-                    logger.info("XMPP: OMEMO voice message sent to %s", recipient.bare)
-                    return SendResult(success=True)
-            except Exception as exc:
-                logger.warning("XMPP: OMEMO voice send failed (%s); falling back", exc)
-
-        msg.send()
-        logger.info("XMPP: voice message sent to %s", recipient.bare)
-        return SendResult(success=True)
+        self._attach_media_sharing_metadata(msg, url, filename, content_type, len(audio_bytes))
+        return await self._send_media_stanza(msg, recipient, "voice message")
 
     async def send_image_file(
         self,
@@ -977,29 +1020,56 @@ class XMPPAdapter(BasePlatformAdapter):
         msg["body"] = caption if caption else url
         msg["id"] = self.client.new_id()
 
-        if url.startswith("aesgcm://"):
-            try:
-                ns_sshare = "urn:xmpp:sfs:0"
-                ns_share = "urn:xmpp:share:1"
-                ns_oob = "jabber:x:oob"
+        self._attach_media_sharing_metadata(msg, url, filename, content_type, len(image_bytes))
+        return await self._send_media_stanza(msg, recipient, "image")
 
-                sfs = ET.Element("{" + ns_sshare + "}file-sharing")
-                file_el = ET.SubElement(sfs, "{" + ns_share + "}file")
-                ET.SubElement(file_el, "{" + ns_share + "}name").text = filename
-                ET.SubElement(file_el, "{" + ns_share + "}media-type").text = content_type
-                ET.SubElement(file_el, "{" + ns_share + "}size").text = str(len(image_bytes))
 
-                sources = ET.SubElement(sfs, "{" + ns_sshare + "}sources")
-                ref = ET.SubElement(sources, "{" + ns_sshare + "}reference")
-                ref.set("type", "http")
-                ref.set("url", url)
 
-                data_el = ET.SubElement(sfs, "{" + ns_oob + "}data")
-                data_el.set("url", url)
+    def _attach_media_sharing_metadata(
+        self, msg, url: str, filename: str, content_type: str, size: int
+    ) -> None:
+        """Attach XEP-0447 stateless-file-sharing + OOB metadata to a media stanza.
 
-                msg.xml.append(sfs)
-            except Exception as exc:
-                logger.debug("XMPP: could not attach media-sharing metadata: %s", exc)
+        Used for ``aesgcm://`` URLs so Conversations-style clients can resolve and
+        inline the shared file. Best-effort: failures are logged at debug and the
+        plain URL body is still delivered.
+        """
+        if not url.startswith("aesgcm://"):
+            return
+        try:
+            ns_sshare = "urn:xmpp:sfs:0"
+            ns_share = "urn:xmpp:share:1"
+            ns_oob = "jabber:x:oob"
+
+            sfs = ET.Element("{" + ns_sshare + "}file-sharing")
+            file_el = ET.SubElement(sfs, "{" + ns_share + "}file")
+            ET.SubElement(file_el, "{" + ns_share + "}name").text = filename
+            ET.SubElement(file_el, "{" + ns_share + "}media-type").text = content_type
+            ET.SubElement(file_el, "{" + ns_share + "}size").text = str(size)
+
+            sources = ET.SubElement(sfs, "{" + ns_sshare + "}sources")
+            ref = ET.SubElement(sources, "{" + ns_sshare + "}reference")
+            ref.set("type", "http")
+            ref.set("url", url)
+
+            data_el = ET.SubElement(sfs, "{" + ns_oob + "}data")
+            data_el.set("url", url)
+
+            msg.xml.append(sfs)
+        except Exception as exc:
+            logger.debug("XMPP: could not attach media-sharing metadata: %s", exc)
+
+    async def _send_media_stanza(self, msg, recipient: JID, kind_label: str) -> SendResult:
+        """Send a media stanza, encrypting for OMEMO-active chats and refusing a plaintext downgrade.
+
+        For a chat that is OMEMO-active the ``aesgcm://`` key must not travel in a
+        plaintext body, so an encryption failure is a hard error (matching
+        ``_send_text``) rather than a silent plaintext fallback. Non-OMEMO chats
+        fall back to plaintext, which is the normal XEP-0454 transport for peers
+        that do not use OMEMO.
+        """
+        recipient_bare = str(recipient.bare)
+        force_omemo = self.omemo_enabled and recipient_bare in self._omemo_chats
 
         omemo = self._omemo_plugin()
         if omemo is not None and self.omemo_enabled:
@@ -1007,20 +1077,26 @@ class XMPPAdapter(BasePlatformAdapter):
                 encrypted, _errors = await omemo.encrypt_message(
                     msg,
                     recipient_jids={recipient},
-                    identifier=str(recipient),
+                    identifier=recipient_bare,
                 )
                 if encrypted:
                     encrypted.send()
-                    logger.info("XMPP: OMEMO image sent to %s", recipient.bare)
+                    logger.info("XMPP: OMEMO %s sent to %s", kind_label, recipient.bare)
                     return SendResult(success=True)
             except Exception as exc:
-                logger.warning("XMPP: OMEMO image send failed (%s); falling back", exc)
+                logger.warning("XMPP: OMEMO %s send failed (%s)", kind_label, exc)
+
+        if force_omemo:
+            logger.error(
+                "XMPP: refusing to send %s to OMEMO chat %s in plaintext",
+                kind_label,
+                recipient_bare,
+            )
+            return SendResult(success=False, error="OMEMO encryption required but failed")
 
         msg.send()
-        logger.info("XMPP: image sent to %s", recipient.bare)
+        logger.info("XMPP: %s sent to %s", kind_label, recipient.bare)
         return SendResult(success=True)
-
-
 
     async def _upload_encrypted_media(self, plaintext: bytes, filename: str, content_type: str) -> Optional[str]:
         """Encrypt plaintext with AES-256-GCM and upload via HTTP File Upload.
@@ -1050,9 +1126,16 @@ class XMPPAdapter(BasePlatformAdapter):
             if not get_url:
                 return None
 
-            # Convert https://upload... to aesgcm://upload... and append IV+key
+            # Convert https://upload... to aesgcm://upload... and append IV+key.
+            # Handles http:// too so a non-TLS upload host still yields a valid
+            # aesgcm:// URL rather than being silently left as a plain http URL.
             fragment = (iv + key).hex()
-            aesgcm_url = get_url.replace("https://", "aesgcm://", 1) + "#" + fragment
+            if get_url.startswith("https://"):
+                aesgcm_url = get_url.replace("https://", "aesgcm://", 1) + "#" + fragment
+            elif get_url.startswith("http://"):
+                aesgcm_url = get_url.replace("http://", "aesgcm://", 1) + "#" + fragment
+            else:
+                aesgcm_url = "aesgcm://" + get_url + "#" + fragment
             return aesgcm_url
         except Exception as exc:
             logger.warning("XMPP: encrypted media upload failed: %s", exc)
@@ -1239,11 +1322,17 @@ class XMPPAdapter(BasePlatformAdapter):
         try:
             if url.startswith("aesgcm://"):
                 return await self._download_aesgcm(url)
+            if await asyncio.to_thread(_media_download_blocked, url):
+                logger.warning(
+                    "XMPP: refusing media download from internal address: %s",
+                    _log_safe_url(url),
+                )
+                return None
             resp = await self._http.get(url)
             resp.raise_for_status()
             return resp.content
         except Exception as exc:
-            logger.warning("XMPP: failed to download %s: %s", url, exc)
+            logger.warning("XMPP: failed to download %s: %s", _log_safe_url(url), exc)
             return None
 
     async def _download_aesgcm(self, url: str) -> Optional[bytes]:
@@ -1256,6 +1345,12 @@ class XMPPAdapter(BasePlatformAdapter):
             iv = bytes.fromhex(fragment[:24])
             key = bytes.fromhex(fragment[24:])
             https_url = f"https://{parsed.netloc}{parsed.path}"
+            if await asyncio.to_thread(_media_download_blocked, https_url):
+                logger.warning(
+                    "XMPP: refusing aesgcm media download from internal address: %s",
+                    _log_safe_url(url),
+                )
+                return None
             resp = await self._http.get(https_url)
             resp.raise_for_status()
             ciphertext = resp.content
@@ -1263,7 +1358,7 @@ class XMPPAdapter(BasePlatformAdapter):
             plaintext = aesgcm.decrypt(iv, ciphertext, None)
             return plaintext
         except Exception as exc:
-            logger.warning("XMPP: failed to decrypt aesgcm %s: %s", url, exc)
+            logger.warning("XMPP: failed to decrypt aesgcm %s: %s", _log_safe_url(url), exc)
             return None
 
     def _extract_url(self, text: str) -> Optional[str]:
@@ -1279,53 +1374,40 @@ class XMPPAdapter(BasePlatformAdapter):
 
     # -- Avatar --------------------------------------------------------------
 
-    def _avatar_state_path(self) -> Path:
-        """Path to the small JSON file caching the last-published avatar fingerprint.
+    @staticmethod
+    def _avatar_sha1(data: bytes) -> str:
+        """sha1 of the avatar bytes, matching slixmpp's XEP-0084 ``generate_id``."""
+        return hashlib.sha1(data).hexdigest()
 
-        Lives next to the OMEMO store so it survives gateway restarts. Persisting
-        the fingerprint lets us skip re-publishing an unchanged avatar on every
-        connect instead of pushing it again each time the gateway starts.
+    async def _server_has_avatar(self, data: bytes) -> bool:
+        """True when the server already stores this exact avatar for the bot.
+
+        Queries the server's current vCard (XEP-0054) and compares its PHOTO
+        BINVAL sha1 to the local bytes. This is the same call slixmpp's
+        ``set_avatar`` makes internally, so it is authoritative: when it matches,
+        the avatar is already published and there is nothing to re-send (and no
+        ``send_last_presence`` that would surface as a duplicate "online" blip).
+
+        Best-effort: any failure returns False so the caller publishes rather
+        than incorrectly skipping.
         """
+        client = self.client
+        if client is None:
+            return False
         try:
-            from hermes_constants import get_hermes_home
-
-            return get_hermes_home() / "sessions" / "avatar_state.json"
-        except Exception:
-            return Path(self.avatar_path).with_suffix(".avatar_state.json")
-
-    def _avatar_fingerprint_of(self, path: Path) -> Optional[str]:
-        """Stable fingerprint of the avatar source file (size + mtime).
-
-        Cheap (a stat, not a full hash) and changes whenever the file is replaced
-        or touched, which is the signal a republish is actually warranted.
-        """
-        try:
-            st = path.stat()
-        except OSError:
-            return None
-        return f"{st.st_size}:{int(st.st_mtime_ns)}"
-
-    def _load_avatar_fingerprint(self) -> Optional[str]:
-        """Read the last-published avatar fingerprint from disk, if present."""
-        try:
-            data = json.loads(self._avatar_state_path().read_text(encoding="utf-8"))
-            if isinstance(data, dict) and data.get("path") == self.avatar_path:
-                return data.get("fingerprint")
-        except Exception:
-            pass
-        return None
-
-    def _save_avatar_fingerprint(self, fingerprint: str) -> None:
-        """Persist the last-published avatar fingerprint across restarts."""
-        try:
-            state_path = self._avatar_state_path()
-            state_path.parent.mkdir(parents=True, exist_ok=True)
-            state_path.write_text(
-                json.dumps({"path": self.avatar_path, "fingerprint": fingerprint}),
-                encoding="utf-8",
+            vcard = await asyncio.wait_for(
+                client.plugin["xep_0054"].get_vcard(
+                    client.boundjid.bare, cached=False
+                ),
+                timeout=15.0,
             )
+            stored = vcard["vcard_temp"]["PHOTO"]["BINVAL"]
+            if not stored:
+                return False
+            return hashlib.sha1(bytes(stored)).hexdigest() == self._avatar_sha1(data)
         except Exception as exc:
-            logger.debug("XMPP: could not persist avatar fingerprint: %s", exc)
+            logger.debug("XMPP: could not read server vCard to compare avatar: %s", exc)
+            return False
 
     async def _publish_avatar(self) -> None:
         if not self.avatar_path or self.client is None:
@@ -1336,19 +1418,17 @@ class XMPPAdapter(BasePlatformAdapter):
                 logger.warning("XMPP: avatar path does not exist: %s", self.avatar_path)
                 return
 
-            # Skip the republish when the file has not changed since the last
-            # successful publish (fingerprint persisted across restarts).
-            fingerprint = self._avatar_fingerprint_of(path)
-            if fingerprint is not None and fingerprint == (
-                self._avatar_fingerprint or self._load_avatar_fingerprint()
-            ):
-                logger.info("XMPP: avatar unchanged (%s); skipping republish", fingerprint)
-                self._avatar_fingerprint = fingerprint
-                return
-
             # Image processing is blocking CPU work; run it off the event loop so
             # a large source image cannot stall the gateway loop during startup.
             data, width, height = await asyncio.to_thread(self._prepare_avatar_bytes, path)
+
+            # Ask the server whether it already has this exact avatar. When it
+            # does there is nothing to publish: republishing on every start is
+            # what produced the duplicate "bot is online" toast (set_avatar's
+            # send_last_presence re-broadcast presence ~1s after the initial one).
+            if await self._server_has_avatar(data):
+                logger.info("XMPP: avatar already on server; skipping publish")
+                return
 
             # Always publish vCard avatar (XEP-0153); most clients use this.
             vcard_avatar = self.client.plugin.get("xep_0153", None)
@@ -1382,11 +1462,6 @@ class XMPPAdapter(BasePlatformAdapter):
                     logger.warning("XMPP: PEP avatar publish failed: %s", exc)
             else:
                 logger.debug("XMPP: xep_0084 plugin not available")
-
-            # Record success so the next restart skips the unchanged republish.
-            if fingerprint is not None:
-                self._avatar_fingerprint = fingerprint
-                self._save_avatar_fingerprint(fingerprint)
         except Exception as exc:
             logger.warning("XMPP: failed to publish avatar: %s", exc, exc_info=True)
 
@@ -1423,13 +1498,14 @@ class XMPPAdapter(BasePlatformAdapter):
         try:
             if self.client:
                 self.client.send_presence()
-                self.client.get_roster()
+                self._roster_request = self.client.get_roster()
         except Exception:
             pass
         self._session_started_event.set()
         # Proactively request presence subscriptions from allowlisted users so
         # fresh installs show online (green) in the contact's client without a
-        # manual re-add. No allowlist configured -> nothing to enumerate.
+        # manual re-add. Users who already have an established subscription are
+        # skipped so every connect does not re-issue a redundant `subscribe`.
         asyncio.create_task(self._send_subscription_requests())
 
     def _allowed_users_set(self) -> set[str]:
@@ -1447,11 +1523,31 @@ class XMPPAdapter(BasePlatformAdapter):
             "true", "1", "yes",
         }
 
+    def _has_established_subscription(self, bare: str) -> bool:
+        """True when the roster already records a subscription to ``bare``.
+
+        A subscription is "established" when the roster says we are subscribed
+        to the contact (``to``) or mutually subscribed (``both``). In both cases
+        re-sending a ``subscribe`` presence on every connect is redundant; only
+        a contact with no subscription (or a one-way ``from``) warrants a
+        request. Reads the in-memory roster slixmpp built from the server's
+        roster push.
+        """
+        try:
+            if self.client is None or self.client.client_roster is None:
+                return False
+            item = self.client.client_roster[bare]
+            return item["subscription"] in ("to", "both")
+        except Exception:
+            return False
+
     async def _send_subscription_requests(self) -> None:
-        """Option 2: proactively ask each allowlisted JID to add the bot.
+        """Proactively ask allowlisted JIDs for a subscription when one is missing.
 
         Skipped entirely when no allowlist is configured (allow-all or deny-all):
-        there is no one to invite. Errors are logged, never fatal.
+        there is no one to invite. Users who already have an established
+        subscription are skipped so the bot does not re-issue a redundant
+        ``subscribe`` presence on every connect. Errors are logged, never fatal.
         """
         try:
             allowed = self._allowed_users_set()
@@ -1463,9 +1559,22 @@ class XMPPAdapter(BasePlatformAdapter):
             await asyncio.wait_for(
                 self._session_started_event.wait(), timeout=5.0
             )
+            # Wait for the roster to load so we can tell which subscriptions are
+            # already established; fall back to 3s so a slow server cannot make
+            # this a hard stall.
+            if self._roster_request is not None:
+                try:
+                    await asyncio.wait_for(self._roster_request, timeout=3.0)
+                except Exception:
+                    pass
             for bare in sorted(allowed):
                 if bare == JID(self.user_jid).bare.lower():
                     continue  # never subscribe to ourselves
+                if self._has_established_subscription(bare):
+                    logger.debug(
+                        "XMPP: subscription to %s already established; skipping", bare
+                    )
+                    continue
                 try:
                     client.send_presence(pto=bare, ptype="subscribe")
                     logger.info(
@@ -1704,13 +1813,13 @@ class XMPPAdapter(BasePlatformAdapter):
             msg_type = MessageType.TEXT
             original_msg_type = MessageType.TEXT
             if url:
-                logger.debug("XMPP: detected URL in message: %s", url)
+                logger.debug("XMPP: detected URL in message: %s", _log_safe_url(url))
                 if url.startswith("aesgcm://") or _is_media_url(url):
                     if url.startswith("aesgcm://"):
                         data = await self._download_aesgcm(url)
                     else:
                         data = await self._download_url(url)
-                    logger.debug("XMPP: downloaded %d bytes from %s", len(data) if data else 0, url)
+                    logger.debug("XMPP: downloaded %d bytes from %s", len(data) if data else 0, _log_safe_url(url))
                     if data:
                         content_type = _guess_content_type(data)
                         if content_type.startswith("image/"):
@@ -1804,7 +1913,14 @@ class XMPPAdapter(BasePlatformAdapter):
                 raw_message=msg,
                 media_urls=media_urls,
                 media_types=media_types,
-                metadata={"encrypted": encrypted, "media_url": url, "media_path": media_path},
+                metadata={
+                    "encrypted": encrypted,
+                    # The raw media URL can carry the aesgcm:// decryption key in
+                    # its fragment; keep the key out of the agent context and the
+                    # session store by recording a redacted form here.
+                    "media_url": _log_safe_url(url) if url else url,
+                    "media_path": media_path,
+                },
             )
 
             logger.debug("XMPP: about to handle_message event text=%r type=%s", display_text, msg_type)
@@ -1891,9 +2007,18 @@ def is_connected(config) -> bool:
 
 
 def interactive_setup() -> None:
+    """Collect the bot JID and password without echoing the password.
+
+    Invoked by ``hermes setup`` as the platform's ``setup_fn``. Credentials are
+    reported back to the user to persist (the installer writes them via
+    ``post_install.py``, which uses ``getpass``); this prompt must never echo
+    the password to the terminal.
+    """
     import builtins
+    import getpass
+
     jid = builtins.input("XMPP JID (e.g. hermes@example.com): ").strip()
-    password = builtins.input("XMPP password: ").strip()
+    password = getpass.getpass("XMPP password: ").strip()
     if jid and password:
         print(f"Set XMPP_USER_JID={jid} and XMPP_PASSWORD=*** in ~/.hermes/.env")
 
@@ -1928,11 +2053,16 @@ async def _standalone_send(
 
     client = None
     try:
+        raw_port = os.getenv("XMPP_PORT", "").strip()
+        try:
+            port = int(raw_port) if raw_port else 5222
+        except ValueError:
+            port = 5222
         client = ClientXMPP(user_jid, password)
         client.use_message_ids = True
         session_started = asyncio.Event()
         client.add_event_handler("session_start", lambda _: session_started.set())
-        client.connect(host=server or None, port=5222)
+        client.connect(host=server or None, port=port)
         await asyncio.wait_for(session_started.wait(), timeout=30.0)
         msg = client.make_message(mto=JID(chat_id), mtype="chat")
         msg["id"] = client.new_id()

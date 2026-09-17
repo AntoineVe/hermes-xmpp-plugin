@@ -1,5 +1,48 @@
 # Changelog
 
+## [1.3.9] - 2026-09-17
+
+### Fixed
+- **The bot no longer re-issues a `subscribe` presence to every allowlisted user
+  on every connect.** `_send_subscription_requests` now waits for the roster and
+  skips any JID that already has an established subscription (`to` or `both`),
+  which removes the redundant subscription presence the new native install path
+  re-sent on each gateway start. A fresh JID with no subscription still gets the
+  proactive invite.
+
+## [1.3.8] - 2026-09-17
+
+### Security
+- **Inbound media can no longer be used for SSRF.** URLs in incoming messages
+  are now resolved and refused when they point at a loopback, private,
+  link-local, reserved, multicast, or unspecified address (the cloud-metadata
+  and internal-network cases included). Set `XMPP_ALLOW_PRIVATE_DOWNLOADS=true`
+  to permit private-network upload hosts (self-hosted XMPP upload services).
+- **The OMEMO media key is no longer written to logs or the agent context.** An
+  `aesgcm://` URL carries its AES-256-GCM key in the URL fragment, and it was
+  being logged at WARNING/DEBUG and recorded in event metadata. It is now
+  redacted (`#<redacted>`) everywhere.
+- **Media is no longer sent in plaintext to an OMEMO-active chat.** `send_voice`
+  and `send_image_file` now fail closed (matching `_send_text`) instead of
+  downgrading to plaintext and exposing the decryption key in the body.
+
+### Fixed
+- **The avatar is now checked against the server before publishing.** On
+  connect the adapter fetches the bot's current vCard (XEP-0054) and compares
+  its PHOTO sha1 to the local image; it publishes only when the server is
+  missing or differs. This replaces the earlier local file-fingerprint cache,
+  which republished on every restart and (via slixmpp's `send_last_presence`)
+  produced a duplicate "bot is online" toast. A failed server read falls back
+  to publishing rather than skipping.
+- `_standalone_send` now honors `XMPP_PORT` instead of hardcoding 5222.
+- `_upload_encrypted_media` handles `http://` upload URLs, not just `https://`.
+- `interactive_setup` uses `getpass` so the password is not echoed on
+  `hermes setup`.
+
+### Changed
+- `send_voice` and `send_image_file` share extracted helpers for the
+  XEP-0447 file-sharing metadata and the OMEMO-aware send path.
+
 ## [1.3.7] - 2026-09-14
 
 ### Fixed
