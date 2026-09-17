@@ -274,7 +274,7 @@ ruff check .
 python3 -m pytest
 ```
 
-Layout: `plugin.yaml`, `__init__.py`, `adapter.py`, and `omemo_plugin.py` at the repository root are the plugin Hermes installs. `hermes_xmpp_plugin_common.py` holds shared config/`.env` helpers used by `post_install.py` and the tests. `scripts/release.sh` is a maintainer script for cutting releases; it is not part of the installed plugin.
+Layout: `plugin.yaml`, `__init__.py`, `adapter.py`, and `omemo_plugin.py` at the repository root are the plugin Hermes installs. `hermes_xmpp_plugin_common.py` holds shared config/`.env` helpers used by `post_install.py` and the tests.
 
 ## License
 

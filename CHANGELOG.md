@@ -84,7 +84,7 @@
 ## [1.3.4] - 2026-09-13
 
 ### Changed
-- `scripts/release.sh` pushes only the remote of the clone it runs in, so it works in either working copy. Each clone must carry only its own forge remote; never add a public remote to the private clone.
+- `scripts/release.sh` pushes only the remote of the clone it runs in, so it works in either working copy. Each clone must carry only its own forge remote; never add a public remote to the private clone. (Since removed from the public tree: the release script is maintainer-only tooling.)
 
 
 ## [1.3.3] - 2026-09-13
