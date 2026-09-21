@@ -15,6 +15,12 @@ from urllib.parse import urlparse
 import httpx
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from gateway.config import Platform
+from gateway.platforms._shared import (
+    get_scoped_secret as _get_scoped_secret,
+)
+from gateway.platforms._shared import (
+    yaml_env_setter,
+)
 from gateway.platforms.base import (
     BasePlatformAdapter,
     MessageEvent,
@@ -30,6 +36,14 @@ from slixmpp.stanza import Message
 from tools.transcription_tools import transcribe_audio
 
 logger = logging.getLogger(__name__)
+
+# XMPP servers and clients choke on very large stanzas, so send() splits every
+# reply into wire-sized chunks (see _send_text below). MAX_MESSAGE_LENGTH is
+# declared at the true ceiling (below) so the gateway's progress-text and
+# cron-delivery paths do not assume the 4096 default, and splits_long_messages
+# tells the delivery router that send() chunks natively and should receive the
+# full payload rather than a pre-truncated one.
+_WIRE_CHUNK_SIZE = 2000
 
 
 def _omemo_available() -> bool:
@@ -162,22 +176,20 @@ def _guess_audio_is_voice(url: str, body: str, data: Optional[bytes] = None) -> 
 def _guess_audio_extension(url: str, data: bytes) -> str:
     """Return a sensible file extension for an audio file.
 
-    First inspects the file magic bytes, then falls back to the URL extension,
-    then defaults to .ogg.
+    First inspects the file magic bytes via the shared content-type sniffer
+    (single source of truth for magic-byte detection), then falls back to the
+    URL extension, then defaults to .ogg.
     """
-    if len(data) >= 12 and data[4:8] == b"ftyp":
-        return ".m4a"
-    if data.startswith(b"OggS"):
-        # Could be .ogg, .oga, or .opus; .ogg is the safe default.
-        return ".ogg"
-    if data.startswith(b"ID3"):
-        return ".mp3"
-    if len(data) >= 2 and data[:2] in (b"\xff\xfb", b"\xff\xf3"):
-        return ".mp3"
-    if data.startswith(b"RIFF") and len(data) >= 12 and data[8:12] == b"WAVE":
-        return ".wav"
-    if data.startswith(b"\x1a\x45\xdf\xa3"):
-        return ".webm"
+    extension_by_type = {
+        "audio/m4a": ".m4a",
+        "audio/ogg": ".ogg",
+        "audio/mp3": ".mp3",
+        "audio/wav": ".wav",
+        "audio/webm": ".webm",
+    }
+    content_type = _guess_content_type(data)
+    if content_type in extension_by_type:
+        return extension_by_type[content_type]
 
     lowered = url.lower()
     for ext in (".m4a", ".mp4", ".ogg", ".oga", ".opus", ".mp3", ".webm", ".wav"):
@@ -282,7 +294,7 @@ def _media_download_blocked(url: str) -> bool:
     operator who self-hosts their XMPP upload service on a private network can
     opt out with ``XMPP_ALLOW_PRIVATE_DOWNLOADS=true``.
     """
-    if _parse_bool(os.getenv("XMPP_ALLOW_PRIVATE_DOWNLOADS"), False):
+    if _parse_bool(_get_scoped_secret("XMPP_ALLOW_PRIVATE_DOWNLOADS"), False):
         return False
     return _is_blocked_ssrf_url(url)
 
@@ -301,17 +313,27 @@ class XMPPAdapter(BasePlatformAdapter):
       - Outgoing voice/audio messages via the Hermes core TTS tool
     """
 
-    # XMPP has no message-editing transport (edit_message always fails, and
-    # send() cannot return a message id). Declaring this keeps the gateway
-    # from running its stream consumer for XMPP: without it, the consumer
-    # sent a partial first message it could never update, then re-delivered
-    # the rest at end of turn, and when its finalize confirmation did not
-    # land the gateway sent the full response again on top (duplicate
-    # delivery, the documented partial + final shape). Skipping streaming
-    # costs nothing here: there is no edit transport to stream through, and
-    # tool progress and commentary are delivered as separate messages
-    # regardless.
+    # XMPP's only edit primitive is XEP-0308 Last Message Correction: a
+    # one-shot replace of the immediately previous message. It cannot express
+    # the gateway's incremental streamed-edit model, so the draft/stream
+    # consumer's mid-stream edits would be silently dropped and leave a stuck
+    # cursor ("white block") partial.
+    # SUPPORTS_MESSAGE_EDITING=False makes the gateway skip the stream consumer
+    # for XMPP: no orphaned cursor and no duplicate partial+final delivery.
+    # Tool progress still renders mid-turn as separate messages (the
+    # post-install sets display.platforms.xmpp.tool_progress_grouping: separate,
+    # so each tool call is its own send with no edit); only draft streaming of
+    # the final answer and interim commentary are gone. edit_message below stays
+    # and is used by the gateway's long-running "still working" heartbeat, which
+    # edits its bubble in place via XEP-0308.
     SUPPORTS_MESSAGE_EDITING = False
+    # XMPP has no edit or streaming transport, so replies are delivered whole
+    # and split into wire-sized stanzas by send(). Declaring the true ceiling
+    # and the native-chunking capability lets the gateway treat XMPP as a
+    # self-chunking platform instead of assuming the 4096 default ceiling and
+    # pre-truncating cron output at 4000 chars.
+    splits_long_messages = True
+    MAX_MESSAGE_LENGTH = _WIRE_CHUNK_SIZE
 
     def __init__(self, config, **kwargs):
         platform = Platform("xmpp")
@@ -319,23 +341,26 @@ class XMPPAdapter(BasePlatformAdapter):
 
         extra = getattr(config, "extra", {}) or {}
 
-        self.user_jid = os.getenv("XMPP_USER_JID") or extra.get("user_jid", "")
-        self.password = os.getenv("XMPP_PASSWORD") or extra.get("password", "")
-        self.server = os.getenv("XMPP_SERVER") or extra.get("server", "")
+        self.user_jid = _get_scoped_secret("XMPP_USER_JID") or extra.get("user_jid", "")
+        self.password = _get_scoped_secret("XMPP_PASSWORD") or extra.get("password", "")
+        self.server = _get_scoped_secret("XMPP_SERVER") or extra.get("server", "")
         self.port = 5222
-        raw_port = os.getenv("XMPP_PORT") or extra.get("port")
+        raw_port = _get_scoped_secret("XMPP_PORT") or extra.get("port")
         if raw_port:
             try:
                 self.port = int(raw_port)
             except (ValueError, TypeError):
                 self.port = 5222
 
+        # OMEMO is on by default. No installer writes an omemo_enabled key into
+        # config.yaml anymore, so the default lives here in the adapter; an
+        # explicit false (env or config) still disables it.
         self.omemo_enabled = _parse_bool(
-            os.getenv("XMPP_OMEMO_ENABLED") or extra.get("omemo_enabled"), False
+            _get_scoped_secret("XMPP_OMEMO_ENABLED") or extra.get("omemo_enabled"), True
         )
         self.omemo_allow_untrusted = _parse_bool(
-            os.getenv("XMPP_OMEMO_ALLOW_UNTRUSTED")
-            or os.getenv("XMPP_OTR_ALLOW_UNTRUSTED")
+            _get_scoped_secret("XMPP_OMEMO_ALLOW_UNTRUSTED")
+            or _get_scoped_secret("XMPP_OTR_ALLOW_UNTRUSTED")
             or extra.get("omemo_allow_untrusted"),
             True,
         )
@@ -343,15 +368,12 @@ class XMPPAdapter(BasePlatformAdapter):
         self.omemo_storage_path: Optional[Path] = None
         self._omemo_ready_event = asyncio.Event()
 
-        self.typing_indicator = _parse_bool(
-            os.getenv("XMPP_TYPING_INDICATOR") or extra.get("typing_indicator"), True
-        )
         # XEP-0085 typing indicators are always enabled; do not allow config
         # to disable them. This also prevents an accidental null/false value
         # in config.yaml from breaking the composing indicator.
         self.typing_indicator = True
-        self.avatar_path = os.getenv("XMPP_AVATAR_PATH") or extra.get("avatar_path", "")
-        self.home_channel = os.getenv("XMPP_HOME_CHANNEL") or extra.get("home_channel", "")
+        self.avatar_path = _get_scoped_secret("XMPP_AVATAR_PATH") or ""
+        self.home_channel = _get_scoped_secret("XMPP_HOME_CHANNEL") or extra.get("home_channel", "")
 
         self._session_started_event = asyncio.Event()
         self.client: Optional[ClientXMPP] = None
@@ -381,6 +403,12 @@ class XMPPAdapter(BasePlatformAdapter):
         # Track bare JIDs that have sent us OMEMO-encrypted messages so replies
         # to those chats are always encrypted rather than falling back to plaintext.
         self._omemo_chats: set[str] = set()
+        # Per-chat last-sent stanza id. XEP-0308 Last Message Correction can only
+        # replace the immediately previous message, so edit_message must refuse
+        # to correct anything that is no longer the most recent message we sent
+        # (a client silently ignores a correction whose target is not the last
+        # message, leaving the stale bubble on screen).
+        self._last_sent_id: Dict[str, str] = {}
         # Anti-race typing state: stop_typing sets a cooldown so that stray
         # refresh ticks from the base adapter's _keep_typing loop (which may
         # outlive the adapter's own stop_typing call after /new or media sends)
@@ -490,6 +518,7 @@ class XMPPAdapter(BasePlatformAdapter):
             self.client.register_plugin("xep_0334")  # Message Processing Hints
             self.client.register_plugin("xep_0363")  # HTTP File Upload
             self.client.register_plugin("xep_0199")  # XMPP Ping
+            self.client.register_plugin("xep_0308")  # Last Message Correction
 
             if self.omemo_enabled:
                 from hermes_constants import get_hermes_home
@@ -723,6 +752,30 @@ class XMPPAdapter(BasePlatformAdapter):
 
     # -- Sending ---------------------------------------------------------------
 
+    def _resolve_recipient(self, chat_id: str) -> tuple[JID, str]:
+        """Resolve ``chat_id`` to the JID to send to, plus its bare form.
+
+        OMEMO-active chats send to the bare JID so slixmpp-omemo encrypts for
+        every published device; otherwise a cached resource is preferred so the
+        reply lands on the device that last messaged us (matching how Dino /
+        Conversations route replies). Raises ``ValueError`` for an unparseable
+        JID.
+        """
+        recipient = JID(chat_id)
+        recipient_bare = str(recipient.bare)
+        if recipient_bare in self._omemo_chats:
+            recipient = JID(recipient_bare)
+            logger.debug("XMPP: using bare JID for OMEMO chat %s", recipient_bare)
+        else:
+            cached_resource = self._last_resources.get(recipient_bare)
+            if cached_resource:
+                try:
+                    recipient = JID(cached_resource)
+                    logger.debug("XMPP: using cached resource %s", cached_resource)
+                except Exception as exc:
+                    logger.warning("XMPP: could not use cached resource %s: %s", cached_resource, exc)
+        return recipient, recipient_bare
+
     async def send(
         self,
         chat_id: str,
@@ -738,32 +791,13 @@ class XMPPAdapter(BasePlatformAdapter):
             return SendResult(success=False, error="not connected")
 
         try:
-            recipient = JID(chat_id)
+            recipient, recipient_bare = self._resolve_recipient(chat_id)
         except Exception as exc:
             logger.error("XMPP: invalid recipient JID %s: %s", chat_id, exc)
             return SendResult(success=False, error="invalid recipient jid")
 
-        # Reply to the exact resource we last saw from this bare JID, if known.
-        # This matches how real XMPP clients (Dino, Conversations) route replies.
-        # EXCEPTION: for OMEMO-active chats we send to the BARE JID so
-        # slixmpp-omemo encrypts for every published device and all the user's
-        # clients receive the reply. Sending to a single cached resource can
-        # deliver only to the one device that last messaged the bot.
-        recipient_bare = str(recipient.bare)
-        if recipient_bare in self._omemo_chats:
-            recipient = JID(recipient_bare)
-            logger.debug("XMPP: send() using bare JID for OMEMO chat %s", recipient_bare)
-        else:
-            cached_resource = self._last_resources.get(recipient_bare)
-            if cached_resource:
-                try:
-                    recipient = JID(cached_resource)
-                    logger.debug("XMPP: send() using cached resource %s", cached_resource)
-                except Exception as exc:
-                    logger.warning("XMPP: could not use cached resource %s: %s", cached_resource, exc)
-
         text = content
-        is_tool_progress = self._is_tool_progress_message(content)
+        is_tool_progress = self._is_tool_progress_message(content, metadata)
 
         # If this chat has a pending voice reply, update the buffered text
         # instead of sending immediately. Tool progress messages are ignored;
@@ -779,19 +813,36 @@ class XMPPAdapter(BasePlatformAdapter):
         return await self._send_text(recipient, text)
 
     @staticmethod
-    def _is_tool_progress_message(content: str) -> bool:
-        """Return True if the message is a gateway tool-progress indicator.
+    def _is_tool_progress_message(
+        content: str, metadata: Optional[Dict[str, Any]] = None
+    ) -> bool:
+        """Return True if this send must not consume the pending voice reply.
 
         Tool progress messages are ephemeral updates like "💻 Running...",
         "📖 Reading...", or "🐍 Running code..." that should not consume the
-        pending voice reply. The gateway prefixes every tool-progress message
-        with an emoji, so matching the first character (non-alphanumeric,
-        non-space) is simpler and more robust than a fixed verb list, which
-        missed most verbs (Searching, Browsing, Writing, Editing, Generating,
-        Delegating, Scheduling, Asking, Updating, Listing, Clicking, Typing,
-        etc.). A real reply that happens to start with an emoji is an
-        acceptable edge case versus reading every tool call aloud.
+        pending voice reply. Two signals, in priority order:
+
+        1. Gateway metadata. Core already marks every non-turn-final send
+           (commentary, heartbeats, status, approvals) with
+           ``metadata["_interim_send"] = True``; a future core may stamp the
+           tool-progress drain with that same flag or a dedicated
+           ``is_tool_progress`` key. Honoring the flag first means the gate
+           stops depending on message text as soon as core emits it.
+        2. Emoji-prefix fallback. Core's tool-progress renderer prefixes every
+           line with the tool's emoji, so an emoji-first message is tool
+           progress in practice. The tool-progress drain is sent WITHOUT the
+           interim flag today, so this covers it until core emits the flag. It
+           is more robust than a fixed verb list, which missed most verbs
+           (Searching, Browsing, Writing, Editing, Generating, Delegating,
+           Scheduling, Asking, Updating, Listing, Clicking, Typing, etc.). Its
+           one known weakness (a real reply that starts with an emoji) is the
+           reason signal 1 is preferred whenever present.
         """
+        if metadata:
+            if metadata.get("is_tool_progress") or metadata.get("tool_progress"):
+                return True
+            if metadata.get("_interim_send"):
+                return True
         if not content:
             return False
         first = content[0]
@@ -857,19 +908,18 @@ class XMPPAdapter(BasePlatformAdapter):
 
     async def _send_text(self, recipient: JID, text: str) -> SendResult:
         logger.debug("XMPP: _send_text() called for %s: %d chars omemo_chats=%s", recipient.bare, len(text), self._omemo_chats)
-        # XMPP servers and clients often choke on very large stanzas.
-        # Split response into smaller, manageable chunks.
-        chunk_size = 2000
-        chunks = [text[i : i + chunk_size] for i in range(0, len(text), chunk_size)]
+        chunks = [text[i : i + _WIRE_CHUNK_SIZE] for i in range(0, len(text), _WIRE_CHUNK_SIZE)]
 
         recipient_bare = str(recipient.bare)
         force_omemo = self.omemo_enabled and recipient_bare in self._omemo_chats
 
+        last_msg_id: Optional[str] = None
         try:
             for i, chunk in enumerate(chunks):
                 msg = self.client.make_message(mto=recipient, mtype="chat")
                 msg["body"] = chunk
                 msg["id"] = self.client.new_id()
+                last_msg_id = msg["id"]
                 # NOTE: no chat-state is set on the outgoing chunks here, and no
                 # trailing <active/> stanza is sent. If a client shows a stuck
                 # "composing" indicator, that is a known gap (see the follow-up
@@ -934,7 +984,9 @@ class XMPPAdapter(BasePlatformAdapter):
             # for a streaming client like EchoTalk. The end-of-turn <active/> is
             # instead sent once by stop_typing() at the true end of the turn
             # (to the bare JID so every resource sees it).
-            return SendResult(success=True)
+            if last_msg_id is not None:
+                self._last_sent_id[recipient_bare] = last_msg_id
+            return SendResult(success=True, message_id=last_msg_id)
         except Exception as exc:
             logger.exception("XMPP: failed to send message to %s: %s", recipient.bare, exc)
             return SendResult(success=False, error=str(exc))
@@ -951,7 +1003,8 @@ class XMPPAdapter(BasePlatformAdapter):
         """Send an audio file as a voice/audio message over XMPP.
 
         Used by the Hermes core auto-TTS path. The file at ``audio_path`` is
-        uploaded and delivered with OMEMO/media-sharing metadata when possible.
+        uploaded and delivered with an XEP-0066 out-of-band reference when
+        applicable.
         """
         try:
             recipient = JID(chat_id)
@@ -968,9 +1021,7 @@ class XMPPAdapter(BasePlatformAdapter):
         content_type = _mime_from_extension(ext)
         filename = f"voice_{uuid.uuid4().hex}{ext}"
 
-        url = await self._upload_encrypted_media(audio_bytes, filename, content_type)
-        if not url:
-            url = await self._upload_file(audio_bytes, filename, content_type)
+        url = await self._upload_media_for_chat(recipient, audio_bytes, filename, content_type)
         if not url:
             return SendResult(success=False, error="HTTP file upload failed")
 
@@ -978,7 +1029,7 @@ class XMPPAdapter(BasePlatformAdapter):
         msg["body"] = caption if caption else url
         msg["id"] = self.client.new_id()
 
-        self._attach_media_sharing_metadata(msg, url, filename, content_type, len(audio_bytes))
+        self._attach_oob_url(msg, url)
         return await self._send_media_stanza(msg, recipient, "voice message")
 
     async def send_image_file(
@@ -992,7 +1043,7 @@ class XMPPAdapter(BasePlatformAdapter):
     ) -> SendResult:
         """Send an image file over XMPP using HTTP File Upload.
 
-        Reuses the same encrypted upload and OMEMO media-sharing metadata as
+        Reuses the same encrypted upload and XEP-0066 out-of-band reference as
         send_voice, but sends an image file suitable for inline display.
         """
         try:
@@ -1010,9 +1061,7 @@ class XMPPAdapter(BasePlatformAdapter):
         content_type = _mime_from_extension(ext)
         filename = f"image_{uuid.uuid4().hex}{ext}"
 
-        url = await self._upload_encrypted_media(image_bytes, filename, content_type)
-        if not url:
-            url = await self._upload_file(image_bytes, filename, content_type)
+        url = await self._upload_media_for_chat(recipient, image_bytes, filename, content_type)
         if not url:
             return SendResult(success=False, error="HTTP file upload failed")
 
@@ -1020,44 +1069,30 @@ class XMPPAdapter(BasePlatformAdapter):
         msg["body"] = caption if caption else url
         msg["id"] = self.client.new_id()
 
-        self._attach_media_sharing_metadata(msg, url, filename, content_type, len(image_bytes))
+        self._attach_oob_url(msg, url)
         return await self._send_media_stanza(msg, recipient, "image")
 
 
 
-    def _attach_media_sharing_metadata(
-        self, msg, url: str, filename: str, content_type: str, size: int
-    ) -> None:
-        """Attach XEP-0447 stateless-file-sharing + OOB metadata to a media stanza.
+    def _attach_oob_url(self, msg, url: str) -> None:
+        """Attach an XEP-0066 Out-of-Band Data element to a media stanza.
 
-        Used for ``aesgcm://`` URLs so Conversations-style clients can resolve and
-        inline the shared file. Best-effort: failures are logged at debug and the
-        plain URL body is still delivered.
+        Marks the http(s) URL in the body as a media attachment (rather than a
+        clickable link) so clients inline it. Replaces the former XEP-0447
+        stateless-file-sharing block, which was Experimental and emitted
+        spec-noncompliant XML. ``aesgcm://`` URLs are deliberately left alone:
+        XEP-0454 specifies no such annotation for them. Best-effort; failures
+        fall back to the plain URL body.
         """
-        if not url.startswith("aesgcm://"):
+        if not url.startswith(("http://", "https://")):
             return
         try:
-            ns_sshare = "urn:xmpp:sfs:0"
-            ns_share = "urn:xmpp:share:1"
             ns_oob = "jabber:x:oob"
-
-            sfs = ET.Element("{" + ns_sshare + "}file-sharing")
-            file_el = ET.SubElement(sfs, "{" + ns_share + "}file")
-            ET.SubElement(file_el, "{" + ns_share + "}name").text = filename
-            ET.SubElement(file_el, "{" + ns_share + "}media-type").text = content_type
-            ET.SubElement(file_el, "{" + ns_share + "}size").text = str(size)
-
-            sources = ET.SubElement(sfs, "{" + ns_sshare + "}sources")
-            ref = ET.SubElement(sources, "{" + ns_sshare + "}reference")
-            ref.set("type", "http")
-            ref.set("url", url)
-
-            data_el = ET.SubElement(sfs, "{" + ns_oob + "}data")
-            data_el.set("url", url)
-
-            msg.xml.append(sfs)
+            x = ET.Element("{" + ns_oob + "}x")
+            ET.SubElement(x, "{" + ns_oob + "}url").text = url
+            msg.xml.append(x)
         except Exception as exc:
-            logger.debug("XMPP: could not attach media-sharing metadata: %s", exc)
+            logger.debug("XMPP: could not attach OOB URL: %s", exc)
 
     async def _send_media_stanza(self, msg, recipient: JID, kind_label: str) -> SendResult:
         """Send a media stanza, encrypting for OMEMO-active chats and refusing a plaintext downgrade.
@@ -1082,7 +1117,8 @@ class XMPPAdapter(BasePlatformAdapter):
                 if encrypted:
                     encrypted.send()
                     logger.info("XMPP: OMEMO %s sent to %s", kind_label, recipient.bare)
-                    return SendResult(success=True)
+                    self._last_sent_id[recipient_bare] = msg["id"]
+                    return SendResult(success=True, message_id=msg["id"])
             except Exception as exc:
                 logger.warning("XMPP: OMEMO %s send failed (%s)", kind_label, exc)
 
@@ -1096,7 +1132,31 @@ class XMPPAdapter(BasePlatformAdapter):
 
         msg.send()
         logger.info("XMPP: %s sent to %s", kind_label, recipient.bare)
-        return SendResult(success=True)
+        self._last_sent_id[recipient_bare] = msg["id"]
+        return SendResult(success=True, message_id=msg["id"])
+
+    async def _upload_media_for_chat(
+        self, recipient: JID, data: bytes, filename: str, content_type: str
+    ) -> Optional[str]:
+        """Upload outbound media, encrypting only for OMEMO-active chats.
+
+        An ``aesgcm://`` URL carries its AES-256-GCM key in the URL fragment, so
+        it is only meaningful when the carrying stanza is itself OMEMO-encrypted
+        (the encryption protects the key). Shipping that key in a plaintext body
+        to a non-OMEMO chat yields no confidentiality (the whole chat is already
+        plaintext) while still placing the key alongside its ciphertext, so
+        non-OMEMO chats upload plain and send a normal ``http(s)://`` URL.
+        """
+        recipient_bare = str(recipient.bare)
+        if self.omemo_enabled and recipient_bare in self._omemo_chats:
+            url = await self._upload_encrypted_media(data, filename, content_type)
+            if url:
+                return url
+            # aesgcm encryption/upload failed; fall back to a plain upload. The
+            # plain http(s) URL still travels inside an OMEMO-encrypted stanza,
+            # so the media location is protected even though the blob is not
+            # independently encrypted at rest.
+        return await self._upload_file(data, filename, content_type)
 
     async def _upload_encrypted_media(self, plaintext: bytes, filename: str, content_type: str) -> Optional[str]:
         """Encrypt plaintext with AES-256-GCM and upload via HTTP File Upload.
@@ -1307,13 +1367,73 @@ class XMPPAdapter(BasePlatformAdapter):
         *,
         finalize: bool = False,
     ) -> SendResult:
-        """XMPP does not support message editing.
+        """Edit a sent message via XEP-0308 Last Message Correction.
 
-        Returning ``success=False`` lets the gateway fall back to sending each
-        tool-progress update as a separate message, so XMPP behaves like
-        Mattermost for live tool status.
+        XEP-0308 can only replace the *immediately previous* message, so this is
+        correct for the gateway's long-running "still working" heartbeat bubble
+        (which is the last thing sent until the next update), but not for
+        arbitrary-message edits. ``message_id`` is the stanza id returned by
+        ``send()``.
         """
-        return SendResult(success=False, error="not supported")
+        if self.client is None:
+            return SendResult(success=False, error="not connected")
+
+        try:
+            recipient, recipient_bare = self._resolve_recipient(chat_id)
+        except Exception as exc:
+            return SendResult(success=False, error=f"invalid recipient jid: {exc}")
+
+        # XEP-0308 only corrects the immediately previous message. If the target
+        # is no longer our last-sent id (e.g. an OMEMO re-key stanza or a media
+        # message landed in between), refuse so the gateway falls back to a fresh
+        # send rather than emitting a correction every client will silently drop.
+        if self._last_sent_id.get(recipient_bare) != message_id:
+            logger.debug(
+                "XMPP: refusing XEP-0308 correction for %s (target %s is not the "
+                "last-sent id %s)",
+                recipient_bare,
+                message_id,
+                self._last_sent_id.get(recipient_bare),
+            )
+            return SendResult(success=False, error="not the last message")
+
+        force_omemo = self.omemo_enabled and recipient_bare in self._omemo_chats
+        try:
+            msg = self.client.make_message(mto=recipient, mtype="chat")
+            msg["body"] = content
+            msg["id"] = self.client.new_id()
+            # Attach the correction element targeting the original stanza id.
+            # XEP-0308 exposes it as the "replace" plugin on the Message stanza.
+            msg["replace"]["id"] = message_id
+
+            omemo = self._omemo_plugin()
+            if force_omemo and omemo is not None:
+                # encrypt_message() calls .clear() on the copy, wiping the
+                # <replace/> element; re-attach it after encryption (the same
+                # pattern as the EME tag in _send_text).
+                encrypted, _errors = await omemo.encrypt_message(
+                    msg,
+                    recipient_jids={recipient},
+                    identifier=str(recipient.bare),
+                )
+                if encrypted is None:
+                    return SendResult(success=False, error="OMEMO encryption required but no encrypted stanza produced")
+                if hasattr(encrypted, "xml"):
+                    replace_el = ET.Element("{urn:xmpp:message-correct:0}replace")
+                    replace_el.set("id", message_id)
+                    encrypted.xml.append(replace_el)
+                else:
+                    encrypted["replace"]["id"] = message_id
+                encrypted.send()
+            else:
+                msg.send()
+
+            # The correction itself is now the last message on the wire.
+            self._last_sent_id[recipient_bare] = msg["id"]
+            return SendResult(success=True, message_id=message_id)
+        except Exception as exc:
+            logger.warning("XMPP: edit_message failed for %s: %s", recipient_bare, exc)
+            return SendResult(success=False, error=str(exc))
 
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
         return {"name": chat_id, "type": "dm"}
@@ -1510,7 +1630,7 @@ class XMPPAdapter(BasePlatformAdapter):
 
     def _allowed_users_set(self) -> set[str]:
         """Bare-JID allowlist set from env/config (empty when none configured)."""
-        raw = os.getenv("XMPP_ALLOWED_USERS")
+        raw = _get_scoped_secret("XMPP_ALLOWED_USERS")
         if not raw:
             extra = getattr(getattr(self, "config", None), "extra", None) or {}
             value = extra.get("allowed_users", "")
@@ -1519,7 +1639,7 @@ class XMPPAdapter(BasePlatformAdapter):
         return {e.strip().lower() for e in entries if e and e.strip()}
 
     def _allow_all_users(self) -> bool:
-        return os.getenv("XMPP_ALLOW_ALL_USERS", "").strip().lower() in {
+        return (_get_scoped_secret("XMPP_ALLOW_ALL_USERS", "") or "").strip().lower() in {
             "true", "1", "yes",
         }
 
@@ -1744,9 +1864,8 @@ class XMPPAdapter(BasePlatformAdapter):
 
             # NOTE: do NOT return early on an empty body here. Voice and image
             # messages are often sent as standalone media with an empty text
-            # body; the URL lives in <oob>/<file-sharing>, which is extracted
-            # below. We only drop the message later if there is no body AND no
-            # media URL.
+            # body; the URL lives in <oob>, which is extracted below. We only
+            # drop the message later if there is no body AND no media URL.
 
             # Send read receipt for messages that request it.
             try:
@@ -1766,39 +1885,6 @@ class XMPPAdapter(BasePlatformAdapter):
                         url = url_el.text.strip()
             except Exception:
                 pass
-            if not url:
-                # XEP-0363 HTTP File Upload and XEP-0447 Stateless File Sharing
-                # place the URL inside <file-sharing>/<file>/<uri> or
-                # <file-sharing>/<file>/<desc> plus a source <url>. Clients like
-                # Beagle, Dino, or newer versions of Conversations may use these
-                # instead of the older OOB extension.
-                #
-                # Namespace split (per XEP-0447): <file-sharing> is in
-                # urn:xmpp:sfs:0, but its <file> child is in urn:xmpp:share:1.
-                # The outbound side (send_voice/send_image_file) uses this same
-                # split, so the inbound parser must too.
-                try:
-                    ns_share = "urn:xmpp:share:1"
-                    ns_sshare = "urn:xmpp:sfs:0"
-                    for sfs in msg.xml.findall(f".//{{{ns_sshare}}}file-sharing"):
-                        file_el = sfs.find(f"{{{ns_share}}}file")
-                        if file_el is None:
-                            continue
-                        url_el = file_el.find(f"{{{ns_share}}}uri") or file_el.find(f"{{{ns_share}}}url")
-                        if url_el is not None and url_el.text:
-                            url = url_el.text.strip()
-                            break
-                        # Some clients put the URL in a <sources>/<url> child.
-                        sources = file_el.find(f"{{{ns_share}}}sources") or sfs.find(f"{{{ns_sshare}}}sources")
-                        if sources is not None:
-                            for source_url in sources.findall(f".//{{{ns_share}}}url"):
-                                if source_url is not None and source_url.text:
-                                    url = source_url.text.strip()
-                                    break
-                        if url:
-                            break
-                except Exception:
-                    pass
             if not url:
                 url = self._extract_url(body)
 
@@ -1987,22 +2073,38 @@ class XMPPAdapter(BasePlatformAdapter):
 
 
 def check_requirements() -> bool:
-    try:
-        import slixmpp  # noqa: F401
-        return True
-    except ImportError:
-        return False
+    """Return True when the adapter's top-level imports are all importable.
+
+    adapter.py imports slixmpp, httpx, PIL, and cryptography unconditionally at
+    module load, so probing only slixmpp reports "ready" even when one of the
+    others is missing and the adapter would crash on import. slixmpp-omemo is
+    deliberately not required here: it is optional and only imported when OMEMO
+    is enabled.
+    """
+    for module in ("slixmpp", "httpx", "PIL", "cryptography"):
+        try:
+            __import__(module)
+        except ImportError:
+            return False
+    return True
 
 
 def validate_config(config) -> bool:
     extra = getattr(config, "extra", {}) or {}
     return bool(
-        (os.getenv("XMPP_USER_JID") or extra.get("user_jid"))
-        and (os.getenv("XMPP_PASSWORD") or extra.get("password"))
+        (_get_scoped_secret("XMPP_USER_JID") or extra.get("user_jid"))
+        and (_get_scoped_secret("XMPP_PASSWORD") or extra.get("password"))
     )
 
 
-def is_connected(config) -> bool:
+def is_configured(config) -> bool:
+    """Return True when the platform is configured (credentials present).
+
+    The gateway's platform registry names this enablement hook ``is_connected``,
+    but it is a configuration gate (has the user set credentials?), not a live
+    connection-state probe. The running adapter's real connection state is the
+    base class's ``self.is_connected``.
+    """
     return validate_config(config)
 
 
@@ -2024,9 +2126,9 @@ def interactive_setup() -> None:
 
 
 def _env_enablement() -> Optional[dict]:
-    user_jid = os.getenv("XMPP_USER_JID", "").strip()
-    password = os.getenv("XMPP_PASSWORD", "").strip()
-    server = os.getenv("XMPP_SERVER", "").strip()
+    user_jid = (_get_scoped_secret("XMPP_USER_JID", "") or "").strip()
+    password = (_get_scoped_secret("XMPP_PASSWORD", "") or "").strip()
+    server = (_get_scoped_secret("XMPP_SERVER", "") or "").strip()
     if not user_jid or not password:
         return None
     extra: dict = {"user_jid": user_jid, "password": password}
@@ -2045,15 +2147,15 @@ async def _standalone_send(
     force_document=False,
 ) -> dict:
     extra = getattr(pconfig, "extra", {}) or {}
-    user_jid = os.getenv("XMPP_USER_JID") or extra.get("user_jid", "")
-    password = os.getenv("XMPP_PASSWORD") or extra.get("password", "")
-    server = os.getenv("XMPP_SERVER") or extra.get("server", "")
+    user_jid = _get_scoped_secret("XMPP_USER_JID") or extra.get("user_jid", "")
+    password = _get_scoped_secret("XMPP_PASSWORD") or extra.get("password", "")
+    server = _get_scoped_secret("XMPP_SERVER") or extra.get("server", "")
     if not user_jid or not password:
         return {"error": "XMPP_USER_JID and XMPP_PASSWORD must be configured"}
 
     client = None
     try:
-        raw_port = os.getenv("XMPP_PORT", "").strip()
+        raw_port = (_get_scoped_secret("XMPP_PORT", "") or "").strip()
         try:
             port = int(raw_port) if raw_port else 5222
         except ValueError:
@@ -2087,7 +2189,6 @@ _XMPP_YAML_KEYS = (
     "port",
     "omemo_enabled",
     "omemo_allow_untrusted",
-    "avatar_path",
     "home_channel",
     "allowed_users",
     "allow_all_users",
@@ -2099,11 +2200,16 @@ def _apply_yaml_config(yaml_cfg: dict, platform_cfg: dict) -> Optional[dict]:
     # Bridge the allowlist / allow-all config keys to the env vars the gateway
     # authorization layer reads (XMPP_ALLOWED_USERS / XMPP_ALLOW_ALL_USERS), so
     # config.yaml is the source of truth for access control. Env vars win when
-    # already set (env > YAML precedence).
-    if "allow_all_users" in platform_cfg and not os.getenv("XMPP_ALLOW_ALL_USERS"):
-        os.environ["XMPP_ALLOW_ALL_USERS"] = str(platform_cfg["allow_all_users"]).lower()
-    if "allowed_users" in platform_cfg and not os.getenv("XMPP_ALLOWED_USERS"):
-        os.environ["XMPP_ALLOWED_USERS"] = str(platform_cfg["allowed_users"])
+    # already set (env > YAML precedence). The shared setter skips the env write
+    # under a secondary multiplex profile's scope so one profile's allowlist
+    # never pins another's process-wide (first-writer-wins poisoning, #80099);
+    # the values are still seeded into ``extra`` above so each profile reads its
+    # own through the scoped getter.
+    set_env = yaml_env_setter()
+    if "allow_all_users" in platform_cfg:
+        set_env("XMPP_ALLOW_ALL_USERS", str(platform_cfg["allow_all_users"]).lower())
+    if "allowed_users" in platform_cfg:
+        set_env("XMPP_ALLOWED_USERS", str(platform_cfg["allowed_users"]))
     return seeded if seeded else None
 
 
@@ -2114,7 +2220,7 @@ def register(ctx):
         adapter_factory=lambda cfg: XMPPAdapter(cfg),
         check_fn=check_requirements,
         validate_config=validate_config,
-        is_connected=is_connected,
+        is_connected=is_configured,
         required_env=["XMPP_USER_JID", "XMPP_PASSWORD"],
         install_hint="Talk to Hermes over XMPP",
         setup_fn=interactive_setup,

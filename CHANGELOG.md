@@ -1,5 +1,60 @@
 # Changelog
 
+## [2.0.0] - 2026-09-20
+
+This public release bundles the private-forge 1.4.0 through 1.12.1 iterations
+into one 2.0.0 release. The major bump reflects a real compatibility boundary:
+the adapter now requires a gateway core that provides the scoped-secret API
+(`gateway.platforms._shared.get_scoped_secret` / `yaml_env_setter`), and several
+configuration surfaces changed (see below). Net changes, oldest first.
+
+### Fixed
+- **Multiplexed profiles no longer collide on the bot JID.** Every `XMPP_*`
+  credential and access-control read goes through the gateway's shared
+  scoped-secret reader instead of a raw `os.getenv`, so a secondary profile's
+  adapter no longer connects with the default profile's JID and flaps on a
+  resource conflict.
+- **XEP-0308 corrections no longer target a stale message.** `edit_message`
+  tracks the adapter's own last-sent stanza id per chat and refuses to emit a
+  Last Message Correction when the target is not the most recent message.
+
+### Added
+- **`edit_message` via XEP-0308 Last Message Correction.** The adapter returns
+  the stanza id from `send()` and edits the live heartbeat bubble in place.
+- **`post_uninstall.py`.** Run after `hermes plugins remove` to drop the
+  `display.platforms.xmpp.tool_progress_grouping` key, the stale
+  `xmpp-platform`/`platforms/xmpp` plugin entries, and (with `--omemo`) the
+  OMEMO store, while leaving the `XMPP_*` `.env` vars and pairing grants alone.
+
+### Changed
+- **Delivers each reply whole, with one message per tool call.** The gateway
+  stream consumer is disabled for XMPP (`SUPPORTS_MESSAGE_EDITING = False`):
+  the final answer arrives as one clean message (split into ~2000-char chunks)
+  and tool progress renders as a separate message per tool call instead of a
+  single growing bubble. Live progress (typing, tool calls, the still-working
+  heartbeat) still shows mid-turn.
+- **Declares its transport shape to the gateway.** `splits_long_messages =
+  True` and `MAX_MESSAGE_LENGTH = 2000` let the cron-delivery and tool-progress
+  paths use the real ceiling instead of assuming the 4096 default.
+- **Media metadata moved from XEP-0447 to XEP-0066 Out-of-Band Data.** Outbound
+  media attaches a plain `<x xmlns='jabber:x:oob'><url/></x>` for http(s) URLs
+  and leaves `aesgcm://` unannotated per XEP-0454; the inbound file-sharing
+  parser was removed.
+- **Dropped the vendored `deps/` tree.** Dependencies are declared in
+  `pyproject.toml` and installed into the Hermes venv by the native installer.
+- **OMEMO is on by default** (adapter default, no config key required); an
+  explicit `XMPP_OMEMO_ENABLED=false` still disables it.
+- **`post_install.py` shrank** to setting the tool-progress key and prompting
+  for an optional avatar; it no longer prompts for JID/password, the allowlist,
+  the home channel, or voice/STT defaults (all handled natively). It also no
+  longer needs a `--non-interactive` flag.
+- **Avatar is env-only** (`XMPP_AVATAR_PATH`); the `platforms.xmpp.avatar_path`
+  config key is no longer read.
+
+### Removed
+- The `platforms.xmpp.avatar_path` config key and the vendored dependency
+  directory are gone; the OMEMO/docs settings now come from `.env`.
+
 ## [1.3.9] - 2026-09-17
 
 ### Fixed
@@ -84,7 +139,7 @@
 ## [1.3.4] - 2026-09-13
 
 ### Changed
-- `scripts/release.sh` pushes only the remote of the clone it runs in, so it works in either working copy. Each clone must carry only its own forge remote; never add a public remote to the private clone. (Since removed from the public tree: the release script is maintainer-only tooling.)
+- `scripts/release.sh` pushes only the remote of the clone it runs in, so it works in either working copy. Each clone must carry only its own forge remote; never add a public remote to the private clone. (Since moved out of the repo: the release script is now a shared forge-aware tool that lives in the skill, not in either forge's tree.)
 
 
 ## [1.3.3] - 2026-09-13

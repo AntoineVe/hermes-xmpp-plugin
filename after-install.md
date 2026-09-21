@@ -2,7 +2,7 @@
 
 Two more steps to finish the install.
 
-1. Finish setup (dependencies, default config, credentials, allowlist, home channel):
+1. Finish setup (tool-progress display default and optional avatar):
 
    ```
    python3 ~/.hermes/plugins/xmpp-platform/post_install.py

@@ -1,9 +1,9 @@
-"""Common helpers for the Hermes XMPP plugin installer/uninstaller.
+"""Common helpers for the Hermes XMPP plugin post-install script.
 
 These helpers deliberately avoid heavy dependencies like PyYAML/ruamel.yaml
-so the scripts can run in a clean environment. They operate on the
-plugins.enabled list in ~/.hermes/config.yaml with regex-based mutations that
-preserve comments and formatting as much as possible.
+so the script can run in a clean environment. They operate on
+~/.hermes/config.yaml with regex-based mutations that preserve comments and
+formatting as much as possible.
 """
 
 from __future__ import annotations
@@ -11,28 +11,10 @@ from __future__ import annotations
 import os
 import re
 import shutil
-import sys
 from pathlib import Path
 from typing import Optional
 
 DEFAULT_HERMES_HOME = Path.home() / ".hermes"
-
-
-def get_yaml_editor():
-    """Return a YAML loader/dumper and a flag indicating whether it is ruamel.yaml."""
-    try:
-        from ruamel.yaml import YAML
-        yaml = YAML()
-        yaml.preserve_quotes = True
-        return yaml, True
-    except ImportError:
-        pass
-    try:
-        import yaml
-        return yaml, False
-    except ImportError:
-        pass
-    return None, False
 
 
 def get_hermes_home(cli_value: Optional[str] = None) -> Path:
@@ -76,44 +58,6 @@ def get_profile_dir(hermes_home: Path, profile: Optional[str] = None) -> Path:
     return hermes_home
 
 
-def get_hermes_python(
-    hermes_home: Path,
-    cli_python: Optional[str] = None,
-    fallback_home: Optional[Path] = None,
-) -> Path:
-    """Find a suitable Python interpreter.
-
-    Priority:
-    1. CLI --python argument
-    2. Profile-local Hermes venv: <home>/hermes-agent/venv/bin/python
-    3. Profile-local source venv: <home>/hermes-agent/.venv/bin/python
-    4. Base/default Hermes venv: <fallback_home>/hermes-agent/venv/bin/python
-    5. Current interpreter
-    """
-    if cli_python:
-        python = Path(cli_python).expanduser().resolve()
-        if python.exists():
-            return python
-        raise FileNotFoundError(f"Specified python not found: {python}")
-
-    candidates = [
-        hermes_home / "hermes-agent" / "venv" / "bin" / "python",
-        hermes_home / "hermes-agent" / ".venv" / "bin" / "python",
-        Path.home() / ".local" / "share" / "hermes" / "venv" / "bin" / "python",
-    ]
-    if fallback_home and fallback_home != hermes_home:
-        candidates.extend([
-            fallback_home / "hermes-agent" / "venv" / "bin" / "python",
-            fallback_home / "hermes-agent" / ".venv" / "bin" / "python",
-        ])
-
-    for candidate in candidates:
-        if candidate.exists():
-            return candidate.resolve()
-
-    return Path(sys.executable)
-
-
 def backup_file(path: Path, suffix: str) -> Path:
     """Create a numbered backup of path."""
     backup_path = path.with_suffix(path.suffix + suffix)
@@ -151,620 +95,121 @@ def _find_block_bounds(text: str, key: str) -> tuple[int, int]:
     return start, end
 
 
-def _iter_plugin_blocks(config_text: str) -> list[tuple[int, int, list[str]]]:
-    """Return (start, end, block_lines) for every top-level 'plugins:' block.
+def add_xmpp_display_defaults(config_text: str) -> str:
+    """Ensure XMPP uses one-message-per-tool progress (no XEP-0308 edits).
 
-    Configs touched by older installers can carry duplicate 'plugins:' blocks
-    (e.g. an empty flow-style 'enabled: []' left by profile creation followed
-    by the installer's block). Block-scoped logic must consider all of them
-    because YAML's last-wins rule means later blocks shadow earlier ones.
+    The gateway's default tool-progress grouping is ``accumulate`` (edit one
+    growing bubble). XMPP's only edit primitive, XEP-0308 Last Message
+    Correction, can replace only the immediately-previous message, so an
+    accumulate bubble is refused (``not the last message``) whenever
+    commentary, an OMEMO re-key stanza, or media lands between tool calls.
+    ``separate`` renders each tool as its own message with no edits, which is
+    the only grouping XMPP can deliver reliably.
+
+    Writes ``display.platforms.xmpp.tool_progress_grouping: separate``. An
+    existing explicit user value is preserved (overwrite=False), so this never
+    clobbers a deliberate choice.
     """
-    lines = config_text.splitlines()
-    blocks: list[tuple[int, int, list[str]]] = []
-    pattern = re.compile(r"^plugins:\s*$")
-    for i, line in enumerate(lines):
-        if pattern.match(line):
-            start = i
-            end = len(lines)
-            for j in range(start + 1, len(lines)):
-                candidate = lines[j]
-                if candidate.strip() == "":
-                    continue
-                indent = len(candidate) - len(candidate.lstrip())
-                if indent == 0 and not candidate.lstrip().startswith("#"):
-                    end = j
-                    break
-            blocks.append((start, end, lines[start:end]))
-    return blocks
+    key = "tool_progress_grouping"
+    value = "separate"
 
-
-def _parse_enabled_items(block_lines: list[str]) -> list[str]:
-    """Extract plugin names from a plugins block's enabled list.
-
-    Handles both block style and flow style ('enabled: []', '[a, b]').
-    Returns [] when the block has no enabled list or an empty one.
-    """
-    text = "\n".join(block_lines)
-    enabled_match = re.search(r"enabled:\s*\n((?:\s+-\s+.*)+)", text)
-    if enabled_match:
-        return re.findall(r"-\s+(\S+)", enabled_match.group(1))
-    flow_match = re.search(r"enabled:\s*\[([^\]]*)\]", text)
-    if flow_match:
-        return [
-            item.strip().strip("\"'")
-            for item in flow_match.group(1).split(",")
-            if item.strip()
-        ]
-    return []
-
-
-def _all_enabled_items(config_text: str) -> list[str]:
-    """Union of enabled items across every plugins block."""
-    items: list[str] = []
-    for _start, _end, block_lines in _iter_plugin_blocks(config_text):
-        items.extend(_parse_enabled_items(block_lines))
-    return items
-
-
-# The plugin's canonical ``plugins.enabled`` key: the native installer
-# (``hermes plugins install``) derives it from the plugin manifest name, so
-# ``xmpp-platform`` is what modern installs record. ``platforms/xmpp`` is the
-# legacy key written by older copy-based installers and is cleaned up when
-# seen.
-PLUGIN_ENABLED_KEY = "xmpp-platform"
-LEGACY_PLUGIN_ENABLED_KEY = "platforms/xmpp"
-
-
-def is_plugin_enabled(config_text: str) -> bool:
-    """Return True if the plugin is in plugins.enabled in any plugins block.
-
-    Accepts both the canonical ``xmpp-platform`` key and the legacy
-    ``platforms/xmpp`` key so a config written by an older installer is
-    recognized instead of being enabled twice.
-    """
-    items = _all_enabled_items(config_text)
-    return PLUGIN_ENABLED_KEY in items or LEGACY_PLUGIN_ENABLED_KEY in items
-
-
-def enable_plugin(config_text: str) -> str:
-    """Add the canonical plugin key to plugins.enabled, creating the block if needed.
-
-    A legacy ``platforms/xmpp`` entry from an older copy-based installer is
-    removed in the same pass so the enabled list carries exactly one key for
-    this plugin. With duplicate 'plugins:' blocks (e.g. an empty one left by
-    profile creation plus an installer-written one), YAML's last-wins rule
-    applies, so the item is added to the LAST block's enabled list and stale
-    empty-list plugins blocks before it are dropped.
-    """
-    if LEGACY_PLUGIN_ENABLED_KEY in _all_enabled_items(config_text):
-        config_text = _strip_legacy_enabled_key(config_text)
-    items_now = _all_enabled_items(config_text)
-    if PLUGIN_ENABLED_KEY in items_now:
+    # Already set anywhere under display.platforms.xmpp -> leave untouched.
+    if _nested_key_exists(config_text, ("display", "platforms", "xmpp"), key):
         return config_text
-    # A legacy entry was the only key: replacing it above may have emptied the
-    # list, so fall through and append the canonical key.
 
-    blocks = _iter_plugin_blocks(config_text)
-    if blocks:
-        lines = config_text.splitlines()
-        # Drop stale empty-list plugins blocks that precede the last one.
-        for start, end, block_lines in reversed(blocks[:-1]):
-            if not _parse_enabled_items(block_lines):
-                del lines[start:end]
+    lines = config_text.splitlines()
 
-        text = "\n".join(lines)
-        blocks = _iter_plugin_blocks(text)
-        start, end, block_lines = blocks[-1]
-        block = "\n".join(block_lines)
-        items = _parse_enabled_items(block_lines)
-
-        if re.search(r"^\s+enabled:\s*\n((?:\s+-\s+.*)+)", block):
-            # Block-style list: append using the existing item indent.
-            list_match = re.search(r"enabled:\s*\n((?:\s+-\s+.*)+)", block)
-            if list_match is None:  # pragma: no cover - verified by the branch test
-                raise AssertionError("unreachable: block-style list verified above")
-            indent = list_match.group(1)[: -len(list_match.group(1).lstrip())] or "    "
-            new_block = block.rstrip() + f"\n{indent}- {PLUGIN_ENABLED_KEY}"
-            lines[start:end] = new_block.splitlines()
-        elif items:
-            # Non-empty flow-style list: convert to block style.
-            rendered = "enabled:\n" + "\n".join(f"    - {item}" for item in items)
-            new_block = re.sub(
-                r"enabled:\s*\[[^\]]*\]", rendered, block, count=1
-            ).rstrip() + f"\n    - {PLUGIN_ENABLED_KEY}"
-            lines[start:end] = new_block.splitlines()
-        elif re.search(r"^\s+enabled:\s*\[\s*\]\s*$", block, re.MULTILINE):
-            # Empty flow-style list: convert to block style with the new item.
-            new_block = re.sub(
-                r"enabled:\s*\[\s*\]",
-                f"enabled:\n    - {PLUGIN_ENABLED_KEY}",
-                block,
-                count=1,
-                flags=re.MULTILINE,
-            )
-            lines[start:end] = new_block.splitlines()
-        elif re.search(r"^\s+enabled:\s*$", block, re.MULTILINE):
-            # Empty block-style list: fill it.
-            new_block = block.rstrip() + f"\n    - {PLUGIN_ENABLED_KEY}"
-            lines[start:end] = new_block.splitlines()
-        else:
-            # plugins block without an enabled key: add one.
-            lines[start:end] = block_lines + ["  enabled:", f"    - {PLUGIN_ENABLED_KEY}"]
-
-        result = "\n".join(lines)
-        result = re.sub(r"\n\n\n+", "\n\n", result).rstrip("\n")
-        return result + ("\n" if config_text.endswith("\n") else "\n")
-
-    new_plugins_block = f"plugins:\n  enabled:\n    - {PLUGIN_ENABLED_KEY}\n"
-
-    if re.search(r"^platforms:\s*$", config_text, re.MULTILINE):
-        # Insert plugins block right before platforms block.
-        return re.sub(
-            r"^(platforms:\s*)$",
-            lambda m: new_plugins_block.rstrip() + "\n\n" + m.group(1),
-            config_text,
-            count=1,
-            flags=re.MULTILINE,
+    # Ensure the top-level display: block.
+    dstart, dend = _find_block_bounds(config_text, "display")
+    if dstart < 0:
+        block = (
+            "display:\n"
+            "  platforms:\n"
+            "    xmpp:\n"
+            f"      {key}: {value}\n"
         )
+        return config_text.rstrip() + "\n\n" + block + "\n"
 
-    # Create plugins block at the end of file.
-    return config_text.rstrip() + "\n\n" + new_plugins_block + "\n"
+    dlines = lines[dstart:dend]
+    disp_body = _body_indent(dlines) or 2
 
-
-def _strip_legacy_enabled_key(config_text: str) -> str:
-    """Remove the legacy ``platforms/xmpp`` entry from every plugins block.
-
-    Only that one entry is touched; other plugins in the list are preserved,
-    and a block left with an empty enabled list is dropped. Used by
-    :func:`enable_plugin` to migrate a config written by an older installer.
-    """
-    blocks = _iter_plugin_blocks(config_text)
-    if not blocks:
-        return config_text
-
-    lines = config_text.splitlines()
-    changed = False
-    # Last-to-first so earlier indices stay valid after deletion.
-    for start, end, block_lines in reversed(blocks):
-        if LEGACY_PLUGIN_ENABLED_KEY not in _parse_enabled_items(block_lines):
-            continue
-        changed = True
-        remaining = [
-            line for line in block_lines
-            if not re.match(r"^\s*-\s+platforms/xmpp\s*$", line)
-        ]
-        if _parse_enabled_items(remaining):
-            lines[start:end] = remaining
-        else:
-            del lines[start:end]
-
-    if not changed:
-        return config_text
-    result = re.sub(r"\n\n\n+", "\n\n", "\n".join(lines))
-    return result.rstrip("\n") + ("\n" if config_text.endswith("\n") else "\n")
-
-
-def disable_plugin(config_text: str) -> str:
-    """Remove the plugin from plugins.enabled across ALL plugins blocks.
-
-    A config may contain duplicate 'plugins:' blocks (e.g. an empty one left
-    by profile creation); the item is removed wherever it appears. Blocks
-    whose enabled list is empty afterwards are dropped, so a stale empty-list
-    duplicate does not survive the uninstall. A config without
-    Neither the canonical ``xmpp-platform`` key nor the legacy ``platforms/xmpp``
-    key present anywhere is returned unchanged.
-    """
-    blocks = _iter_plugin_blocks(config_text)
-    if not blocks:
-        return config_text
-
-    lines = config_text.splitlines()
-    removed = False
-    # Process last-to-first so earlier indices stay valid after deletion.
-    for start, end, block_lines in reversed(blocks):
-        items = _parse_enabled_items(block_lines)
-        if not ({PLUGIN_ENABLED_KEY, LEGACY_PLUGIN_ENABLED_KEY} & set(items)):
-            continue
-        removed = True
-        remaining = [
-            line
-            for line in block_lines
-            if not re.match(
-                r"^\s*-\s+(xmpp-platform|platforms/xmpp)\s*$", line
-            )
-        ]
-        if _parse_enabled_items(remaining):
-            lines[start:end] = remaining
-        else:
-            # Enabled list is now empty: drop the whole block.
-            del lines[start:end]
-
-    if not removed:
-        return config_text
-
-    # Drop any remaining plugins blocks with empty enabled lists
-    # (stale duplicates that no longer carry anything).
-    for start, end, block_lines in reversed(_iter_plugin_blocks("\n".join(lines))):
-        if not _parse_enabled_items(block_lines) and re.search(
-            r"^\s+enabled:", "\n".join(block_lines), re.MULTILINE
-        ):
-            del lines[start:end]
-
-    result = "\n".join(lines)
-    # Remove any double blank lines left by removing a block.
-    result = re.sub(r"\n\n\n+", "\n\n", result)
-    return result.rstrip() + "\n"
-
-
-def add_default_xmpp_config(config_text: str, allow_all_users: bool = False) -> str:
-    """Add the default platforms.xmpp block, or restore missing defaults in it.
-
-    When the block already exists this only ADDS absent keys, so an explicit
-    user choice is preserved: ``enabled: false`` is flipped on (the plugin was
-    just installed), and ``omemo_enabled`` / ``omemo_allow_untrusted`` are
-    inserted only when missing. Dropping those two keys on an existing block
-    silently disables the encryption the plugin ships with, so an OMEMO-sending
-    client gets undecryptable inbound messages.
-
-    Credentials are intentionally NOT written into config.yaml; they are stored
-    in the Hermes .env file instead. ``allow_all_users`` reflects the user's
-    explicit choice during install: True means the user opted to allow every
-    sender (no allowlist), False means an allowlist is expected.
-    """
-    allow_all = "true" if allow_all_users else "false"
-    if re.search(r"^platforms:\s*$", config_text, re.MULTILINE):
-        # platforms block exists.
-        start, end = _find_block_bounds(config_text, "platforms")
-        block = "\n".join(config_text.splitlines()[start:end])
-        if re.search(r"^\s+xmpp:\s*$", block, re.MULTILINE):
-            # An xmpp block exists. If it was left disabled (profile default
-            # "enabled: false" on fresh profiles), flip it on so the freshly
-            # installed plugin actually starts, and upsert allow_all_users to
-            # reflect the user's explicit choice.
-            result = re.sub(
-                r"^(\s+xmpp:\s*\n\s+enabled:\s*)false\s*$",
-                r"\1true",
-                config_text,
-                count=1,
-                flags=re.MULTILINE,
-            )
-
-            # Restore the default keys this function is documented to ensure.
-            # An existing block is routinely missing them: the uninstall path
-            # removes and re-adds the block, and configs written before these
-            # defaults existed never had them. Without this, a reinstall leaves
-            # OMEMO off and a client that encrypts by default produces
-            # undecryptable inbound messages (the failure that prompted this).
-            # overwrite=False keeps an explicit user choice (omemo_enabled:
-            # false) intact; only absent keys are added.
-            result = _upsert_xmpp_key(result, "omemo_enabled", "true", overwrite=False)
-            result = _upsert_xmpp_key(
-                result, "omemo_allow_untrusted", "true", overwrite=False
-            )
-            return _upsert_xmpp_allow_all_users(result, allow_all)
-
-        default_xmpp = f"""\n  xmpp:
-    enabled: true
-    omemo_enabled: true
-    omemo_allow_untrusted: true
-    allow_all_users: {allow_all}
-"""
-        return re.sub(
-            r"^(platforms:\s*\n(?:  .+\n?)*)",
-            lambda m: m.group(1).rstrip() + default_xmpp,
-            config_text,
-            count=1,
-            flags=re.MULTILINE,
-        )
-
-    default_block = f"""platforms:
-  xmpp:
-    enabled: true
-    omemo_enabled: true
-    omemo_allow_untrusted: true
-    allow_all_users: {allow_all}
-"""
-    return config_text.rstrip() + "\n\n" + default_block + "\n"
-
-
-def _upsert_xmpp_key(
-    config_text: str, key: str, value: str, *, overwrite: bool = True
-) -> str:
-    """Set ``key`` inside the platforms.xmpp block.
-
-    Replaces the value in place when the key is present and *overwrite* is
-    True; appends the key after the last existing key otherwise. With
-    ``overwrite=False`` an existing value is left alone, so an explicit user
-    choice (e.g. ``omemo_enabled: false``) is never clobbered. Returns
-    config_text unchanged when no platforms.xmpp block is found.
-
-    The search is scoped to the ``platforms:`` block ONLY. A naive search for
-    the first ``xmpp:`` line anywhere in the file can match the ``xmpp:`` key
-    inside ``platform_toolsets:`` (a list of tool names), injecting the key
-    into the middle of that list and corrupting the YAML (``while parsing a
-    block collection``). The installer only ever creates the
-    ``platforms.xmpp`` block, so that is the only one it may touch.
-    """
-    # Locate the top-level platforms: block.
-    pstart, pend = _find_block_bounds(config_text, "platforms")
+    # Find platforms: sub-block inside display, if any.
+    pstart, pend = _find_indented_block(dlines, "platforms")
     if pstart < 0:
-        return config_text
-    lines = config_text.splitlines()
-    platforms_lines = lines[pstart:pend]
-
-    # Within the platforms block, find the xmpp: sub-block (indented).
-    joined = "\n".join(platforms_lines)
-    xmpp_match = re.search(r"^(\s+)xmpp:\s*$", joined, re.MULTILINE)
-    if not xmpp_match:
-        return config_text
-    indent = xmpp_match.group(1)
-    xmpp_indent = len(indent)
-    # xmpp_match is relative to the joined platforms block; map back to an
-    # absolute line index by counting newlines before the match.
-    xstart = pstart + joined[: xmpp_match.start()].count("\n")
-    xend = pend
-    for i in range(xstart + 1, pend):
-        line = lines[i]
-        if line.strip() == "":
-            continue
-        if len(line) - len(line.lstrip()) <= xmpp_indent:
-            xend = i
-            break
-    block = "\n".join(lines[xstart:xend])
-    if re.search(rf"^{indent}\s+{re.escape(key)}:", block, re.MULTILINE):
-        if not overwrite:
-            return config_text
-        block = re.sub(
-            rf"^({indent}\s+{re.escape(key)}:\s*).*$",
-            lambda m: m.group(1) + value,
-            block,
-            count=1,
-            flags=re.MULTILINE,
+        sub = (
+            f"{' ' * disp_body}platforms:\n"
+            f"{' ' * (disp_body + 2)}xmpp:\n"
+            f"{' ' * (disp_body + 4)}{key}: {value}\n"
         )
+        dlines = dlines[:] + sub.splitlines()
+        lines[dstart:dend] = dlines
+        return "\n".join(lines) + "\n"
+
+    plines = dlines[pstart:pend]
+    plat_body = _body_indent(plines) or (disp_body + 2)
+
+    # Find xmpp: sub-block inside platforms, if any.
+    xstart, xend = _find_indented_block(plines, "xmpp")
+    if xstart < 0:
+        sub = (
+            f"{' ' * plat_body}xmpp:\n"
+            f"{' ' * (plat_body + 2)}{key}: {value}\n"
+        )
+        plines = plines[:] + sub.splitlines()
     else:
-        block = block.rstrip() + f"\n{indent}  {key}: {value}"
-    lines[xstart:xend] = block.splitlines()
-    return "\n".join(lines)
+        xlines = plines[xstart:xend]
+        xbody = _body_indent(xlines) or (plat_body + 2)
+        if _block_has_key(xlines, key):
+            return config_text
+        xlines = xlines[:] + [f"{' ' * xbody}{key}: {value}"]
+        plines[xstart:xend] = xlines
 
-
-def _upsert_xmpp_allow_all_users(config_text: str, allow_all: str) -> str:
-    """Set allow_all_users within the platforms.xmpp block (overwriting)."""
-    return _upsert_xmpp_key(config_text, "allow_all_users", allow_all)
-
-
-
-
-
-
-
-def add_voice_and_stt_defaults(config_text: str) -> str:
-    '''Ensure voice/TTS/STT defaults required for XMPP voice replies exist.
-
-    Adds missing top-level blocks and fills in missing provider/auto_tts keys
-    when the block already exists. Existing user settings are preserved.
-    '''
-    config_text = _ensure_block(config_text, "stt", "enabled: true\n  provider: local\n  local:\n    model: tiny")
-    config_text = _ensure_key_in_block(config_text, "stt", "provider", "local")
-
-    config_text = _ensure_block(config_text, "tts", "provider: edge\n  use_gateway: false")
-    config_text = _ensure_key_in_block(config_text, "tts", "provider", "edge")
-
-    config_text = _ensure_block(config_text, "voice", "auto_tts: false")
-    config_text = _ensure_key_in_block(config_text, "voice", "auto_tts", "false")
-
-    return config_text
-
-
-def _ensure_block(config_text: str, key: str, body: str) -> str:
-    """Add a top-level YAML block if it does not exist."""
-    if not re.search(rf"^{re.escape(key)}:\s*$", config_text, re.MULTILINE):
-        config_text = config_text.rstrip() + f"\n\n{key}:\n  {body}\n"
-    return config_text
-
-
-def _ensure_key_in_block(config_text: str, key: str, option: str, value: str) -> str:
-    """Add a key/value under a top-level block if the key is missing."""
-    pattern = re.compile(rf"^{re.escape(key)}:\s*$", re.MULTILINE)
-    match = pattern.search(config_text)
-    if not match:
-        return config_text
-
-    lines = config_text.splitlines()
-    start = config_text[:match.start()].count("\n")
-    key_indent = len(lines[start]) - len(lines[start].lstrip())
-
-    # Scan the block to see whether the option already exists.
-    has_option = False
-    for i in range(start + 1, len(lines)):
-        line = lines[i]
-        if line.strip() == "":
-            continue
-        indent = len(line) - len(line.lstrip())
-        if indent <= key_indent and not line.lstrip().startswith("#"):
-            break
-        stripped = line.lstrip()
-        if stripped.startswith(f"{option}:"):
-            has_option = True
-            break
-
-    if has_option:
-        return config_text
-
-    # Insert the option after the key line, preserving existing body.
-    lines.insert(start + 1, f"{' ' * (key_indent + 2)}{option}: {value}")
+    dlines[pstart:pend] = plines
+    lines[dstart:dend] = dlines
     return "\n".join(lines) + "\n"
 
-def remove_xmpp_config(config_text: str) -> str:
-    """Remove the platforms.xmpp block from config.yaml.
 
-    If the platforms block is left empty, remove it entirely.
-    """
-    start, end = _find_block_bounds(config_text, "platforms")
-    if start < 0:
-        return config_text
+def _body_indent(block_lines: list) -> int | None:
+    """Indent of the first non-empty body line (keys inside a block)."""
+    for ln in block_lines[1:]:
+        if ln.strip():
+            return len(ln) - len(ln.lstrip())
+    return None
 
-    lines = config_text.splitlines()
-    block = lines[start:end]
-    new_block = []
-    skip = False
-    for line in block:
-        stripped = line.lstrip()
-        if stripped.startswith("xmpp:"):
-            skip = True
+
+def _find_indented_block(lines: list, key: str) -> tuple[int, int]:
+    """Locate an INDENTED ``key:`` sub-block within ``lines``; returns (start, end)."""
+    for i, line in enumerate(lines):
+        m = re.match(rf"^(\s+){re.escape(key)}:\s*$", line)
+        if not m:
             continue
-        if skip:
-            indent = len(line) - len(line.lstrip())
-            if stripped and indent <= 2:
-                skip = False
-            else:
+        indent = len(m.group(1))
+        end = len(lines)
+        for j in range(i + 1, len(lines)):
+            lj = lines[j]
+            if lj.strip() == "":
                 continue
-        new_block.append(line)
-
-    # If platforms block only contains the "platforms:" line now, remove it.
-    non_comment = [line for line in new_block if line.strip() and not line.lstrip().startswith("#")]
-    if non_comment == ["platforms:"]:
-        lines[start:end] = []
-    else:
-        lines[start:end] = new_block
-
-    result = "\n".join(lines)
-    result = re.sub(r"\n\n\n+", "\n\n", result)
-    return result.rstrip() + "\n"
+            if len(lj) - len(lj.lstrip()) <= indent and not lj.lstrip().startswith("#"):
+                end = j
+                break
+        return i, end
+    return -1, -1
 
 
-# ---- Env credential helpers (moved from install_xmpp_plugin.py in 1.2.1) ----
-
-def _upsert_env_line(lines: list[str], key: str, value: str) -> tuple[list[str], bool]:
-    """Insert or update KEY="value" among .env lines. Returns (new_lines, changed).
-
-    Updates an existing line in place (dropping duplicate key lines) instead of
-    appending a second entry for the same key.
-    """
-    rendered = f'{key}="{value}"'
-    out: list[str] = []
-    replaced = False
-    changed = False
-    for line in lines:
-        if "=" in line and line.split("=", 1)[0].strip() == key:
-            if replaced:
-                continue  # drop duplicate key lines
-            if line.strip() != rendered:
-                out.append(rendered)
-                changed = True
-            else:
-                out.append(line)
-            replaced = True
-        else:
-            out.append(line)
-    if not replaced:
-        out.append(rendered)
-        changed = True
-    return out, changed
+def _block_has_key(lines: list, key: str) -> bool:
+    return any(re.match(rf"^\s+{re.escape(key)}:", ln) for ln in lines)
 
 
-def normalize_allowed_users(raw: str) -> str:
-    """Normalize a comma-separated XMPP allowlist string ('' when empty)."""
-    return ",".join(part.strip() for part in raw.split(",") if part.strip())
-
-
-def append_env_credentials(
-    env_path: Path,
-    jid: str,
-    password: str,
-    avatar_path: str = "",
-    allowed_users: str = "",
-    allow_all_users: bool = False,
-    home_channel: str = "",
-) -> None:
-    """Append credentials and avatar path to the Hermes .env file if not already present.
-
-    Stores XMPP_USER_JID, XMPP_PASSWORD, and XMPP_AVATAR_PATH. Never writes secrets to config.yaml.
-    XMPP_ALLOWED_USERS is upserted (existing value updated in place) so reinstalling
-    with a new allowlist takes effect without manual .env editing.
-    XMPP_ALLOW_ALL_USERS is written only when the user explicitly opted to allow
-    every sender (no allowlist).
-    XMPP_HOME_CHANNEL is seeded from the first allowed user (cron/restart
-    notification target) unless it is already set in .env. An existing value
-    (or one set later via /sethome) always wins.
-    """
-    lines: list[str] = []
-    if env_path.exists():
-        text = env_path.read_text()
-        lines = text.splitlines()
-        if not text.endswith("\n"):
-            lines.append("")
-
-    existing_keys = {line.split("=", 1)[0].strip() for line in lines if "=" in line}
-    additions: list[str] = []
-    upserted = False
-    if "XMPP_USER_JID" not in existing_keys:
-        additions.append(f'XMPP_USER_JID="{jid}"')
-    if "XMPP_PASSWORD" not in existing_keys:
-        additions.append(f'XMPP_PASSWORD="{password}"')
-    if avatar_path:
-        # Upsert so a corrected path from a later install replaces a stale one;
-        # the old skip-when-present rule silently dropped a corrected value.
-        lines, avatar_upserted = _upsert_env_line(lines, "XMPP_AVATAR_PATH", avatar_path)
-        upserted = upserted or avatar_upserted
-
-    if allowed_users:
-        lines, allowed_upserted = _upsert_env_line(lines, "XMPP_ALLOWED_USERS", allowed_users)
-        upserted = upserted or allowed_upserted
-        # An explicit allowlist must not be silently defeated by a stale
-        # allow-all flag from a previous install. Clear it so the allowlist
-        # actually takes effect.
-        lines, cleared = _upsert_env_line(lines, "XMPP_ALLOW_ALL_USERS", "false")
-        upserted = upserted or cleared
-
-    if allow_all_users:
-        lines, allow_all_upserted = _upsert_env_line(
-            lines, "XMPP_ALLOW_ALL_USERS", "true"
-        )
-        upserted = upserted or allow_all_upserted
-    elif not allowed_users:
-        # No allowlist and not allow-all: clear any stale allow-all flag from a
-        # previous install so the bot defaults to deny-all rather than silently
-        # staying open to every sender.
-        lines, cleared = _upsert_env_line(lines, "XMPP_ALLOW_ALL_USERS", "false")
-        upserted = upserted or cleared
-
-    # Seed the cron/restart-notification home target from the first allowed
-    # user so the bot has a delivery target without /sethome. Never overwrite
-    # an existing XMPP_HOME_CHANNEL (install-time choice or /sethome result).
-    if home_channel and "XMPP_HOME_CHANNEL" not in existing_keys:
-        lines, seeded = _upsert_env_line(lines, "XMPP_HOME_CHANNEL", home_channel)
-        upserted = upserted or seeded
-
-    if additions:
-        body = (lines + additions) if (env_path.exists() or lines) else additions
-        env_path.write_text("\n".join(body) + "\n")
-    elif upserted or (lines and _env_text_changed(env_path, lines)):
-        env_path.write_text("\n".join(lines) + "\n")
-
-    if additions:
-        print(f"Appended credentials to {env_path}")
-
-
-def _env_text_changed(env_path: Path, lines: list[str]) -> bool:
-    if not env_path.exists():
-        return bool(lines)
-    return env_path.read_text() != "\n".join(lines) + "\n"
-
-
-def _load_env_credentials(env_path: Path) -> dict[str, str]:
-    """Load existing credentials from the Hermes .env file."""
-    if not env_path.exists():
-        return {}
-    result: dict[str, str] = {}
-    for line in env_path.read_text().splitlines():
-        line = line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        key, value = line.split("=", 1)
-        key = key.strip()
-        if key in ("XMPP_USER_JID", "XMPP_PASSWORD", "XMPP_ALLOWED_USERS", "XMPP_AVATAR_PATH"):
-            result[key] = value.strip().strip('"\'')
-    return result
+def _nested_key_exists(config_text: str, path: tuple, key: str) -> bool:
+    """True when ``path[0].path[1]...path[n].<key>`` exists (each level indented)."""
+    lines = config_text.splitlines()
+    cur = lines
+    for level in path:
+        start, end = _find_indented_block(cur, level)
+        if start < 0:
+            return False
+        cur = cur[start:end]
+    return _block_has_key(cur, key)
 
 
 def validate_avatar_path(path: str) -> tuple[bool, str]:
@@ -783,3 +228,176 @@ def validate_avatar_path(path: str) -> tuple[bool, str]:
     if not p.is_file():
         return False, f"Avatar path is not a file: {p}"
     return True, ""
+
+
+# ---- Uninstall cleanup helpers (used by post_uninstall.py) ----
+
+def remove_xmpp_display_defaults(config_text: str) -> str:
+    """Remove ``display.platforms.xmpp.tool_progress_grouping`` and collapse
+    any ``xmpp``/``platforms`` sub-block left empty under ``display``.
+
+    Only the display key post_install writes is removed; a user's own explicit
+    ``platforms.xmpp`` block (top-level) and every other display key are left
+    untouched. Returns config_text unchanged when nothing matches.
+    """
+    key = "tool_progress_grouping"
+    dstart, dend = _find_block_bounds(config_text, "display")
+    if dstart < 0:
+        return config_text
+
+    lines = config_text.splitlines()
+    dlines = lines[dstart:dend]
+
+    pstart, pend = _find_indented_block(dlines, "platforms")
+    if pstart < 0:
+        return config_text
+    plines = dlines[pstart:pend]
+
+    xstart, xend = _find_indented_block(plines, "xmpp")
+    if xstart < 0:
+        return config_text
+    xlines = plines[xstart:xend]
+
+    # Drop only the tool_progress_grouping line from the xmpp block.
+    kept = [
+        ln
+        for ln in xlines
+        if not re.match(rf"^\s+{re.escape(key)}:", ln)
+    ]
+    changed = len(kept) != len(xlines)
+    xlines = kept
+
+    # Collapse the xmpp block if it now holds nothing but the header line.
+    if _block_is_header_only(xlines):
+        plines[xstart:xend] = []
+        changed = True
+    else:
+        plines[xstart:xend] = xlines
+
+    # Collapse the platforms block if it now holds nothing but its header.
+    if _block_is_header_only(plines):
+        dlines[pstart:pend] = []
+        changed = True
+    else:
+        dlines[pstart:pend] = plines
+
+    # Collapse the display block if it now holds nothing but its header.
+    if _block_is_header_only(dlines):
+        lines[dstart:dend] = []
+        changed = True
+    else:
+        lines[dstart:dend] = dlines
+
+    if not changed:
+        return config_text
+
+    result = "\n".join(lines)
+    result = re.sub(r"\n\n\n+", "\n\n", result)
+    return result.rstrip() + ("\n" if config_text.endswith("\n") else "")
+
+
+def _block_is_header_only(block_lines: list) -> bool:
+    """True when *block_lines* holds only its header line (index 0) plus
+    blank/comment lines, i.e. the block has no real body and can be dropped."""
+    return all(
+        not ln.strip() or ln.lstrip().startswith("#")
+        for ln in block_lines[1:]
+    )
+
+
+def remove_plugin_enabled_entries(config_text: str) -> str:
+    """Remove this plugin's keys from ``plugins.enabled`` and ``plugins.disabled``.
+
+    Accepts both the canonical ``xmpp-platform`` and the legacy ``platforms/xmpp``
+    key in either list. A list left empty is dropped; a ``plugins`` block left
+    with no ``enabled``/``disabled`` keys is dropped too.
+    """
+    keys = {"xmpp-platform", "platforms/xmpp"}
+
+    def _strip_list(block_lines: list, list_key: str) -> list:
+        """Return *block_lines* with *keys* removed from the ``list_key`` list.
+
+        Handles both block style (``key:`` then indented ``- item`` lines) and
+        flow style (``key: [a, b]``). When no items remain the whole list
+        (header + items) is removed; otherwise only the removed items are
+        dropped, leaving the ``key:`` header in place.
+        """
+        out: list = []
+        i = 0
+        n = len(block_lines)
+        while i < n:
+            ln = block_lines[i]
+            m = re.match(rf"^(\s+){re.escape(list_key)}:(.*)$", ln)
+            if not m:
+                out.append(ln)
+                i += 1
+                continue
+            indent = len(m.group(1))
+            rest = m.group(2)
+            # Flow style: ``enabled: [a, b]``.
+            if rest.strip().startswith("["):
+                inner = rest.strip()[1:-1]
+                items = [it.strip().strip("\"'") for it in inner.split(",") if it.strip()]
+                kept = [it for it in items if it not in keys]
+                if kept:
+                    out.append(f"{' ' * indent}{list_key}: [" + ", ".join(kept) + "]")
+                i += 1
+                continue
+            # Block style: the key line is bare; items follow at deeper indent.
+            j = i + 1
+            while j < n:
+                nxt = block_lines[j]
+                if nxt.strip() == "":
+                    j += 1
+                    continue
+                if (len(nxt) - len(nxt.lstrip())) > indent and re.match(r"^\s+-", nxt):
+                    j += 1
+                    continue
+                break
+            kept_items = []
+            for k in range(i + 1, j):
+                kln = block_lines[k]
+                m2 = re.match(r"^\s+-\s+(\S+)", kln)
+                if m2 and m2.group(1).strip("\"'") not in keys:
+                    kept_items.append(kln)
+            if kept_items:
+                out.append(ln)
+                out.extend(kept_items)
+            # else: drop the header + items entirely.
+            i = j
+        return out
+
+    lines = config_text.splitlines()
+
+    # Split into segments; each top-level ``plugins:`` block becomes its own
+    # isolated line list so mutations never shift indices of later blocks.
+    block_starts = [
+        i for i, ln in enumerate(lines) if re.match(r"^plugins:\s*$", ln)
+    ]
+    # Determine each block's end (next top-level non-blank, non-comment line).
+    segments: list[tuple[int, int]] = []
+    for start in block_starts:
+        end = len(lines)
+        for j in range(start + 1, len(lines)):
+            ln = lines[j]
+            if ln.strip() == "":
+                continue
+            if not ln.startswith((" ", "\t")) and not ln.lstrip().startswith("#"):
+                end = j
+                break
+        segments.append((start, end))
+
+    # Process blocks last-to-first so earlier indices stay valid after edits.
+    for start, end in reversed(segments):
+        block = lines[start:end]
+        for list_key in ("enabled", "disabled"):
+            block = _strip_list(block, list_key)
+        if _block_is_header_only(block):
+            lines[start:end] = []
+        else:
+            lines[start:end] = block
+
+    result = "\n".join(lines)
+    result = re.sub(r"\n\n\n+", "\n\n", result)
+    return result.rstrip() + ("\n" if config_text.endswith("\n") else "")
+

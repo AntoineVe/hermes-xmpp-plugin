@@ -48,18 +48,3 @@ jobs:
           assert 'kind: platform' in text, 'plugin.yaml must declare kind: platform'
           print('Repository root is a valid plugin root')
           "
-
-      - name: Test config mutation helpers
-        run: |
-          python3 -c "
-          from hermes_xmpp_plugin_common import enable_plugin, disable_plugin, add_default_xmpp_config
-          base = '''plugins:
-            enabled:
-              - foo
-          '''
-          assert 'xmpp-platform' in enable_plugin(base)
-          assert 'xmpp-platform' not in disable_plugin(enable_plugin(base))
-          result = add_default_xmpp_config(enable_plugin(''))
-          assert 'xmpp:' in result
-          print('Config mutations OK')
-          "

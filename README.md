@@ -1,6 +1,6 @@
 # Hermes XMPP Platform Plugin
 
-![Version](https://img.shields.io/badge/version-1.3.9-blue)
+![Version](https://img.shields.io/badge/version-2.0.0-blue)
 ![License](https://img.shields.io/badge/license-MIT-green)
 ![Python](https://img.shields.io/badge/python-3.10%2B-blue)
 
@@ -20,6 +20,8 @@ This repository IS a Hermes plugin: the plugin manifest (`plugin.yaml`), the ada
 - [Avatar](#avatar)
 - [Read Receipts (Chat Markers)](#read-receipts-chat-markers)
 - [Inbound Images and Files](#inbound-images-and-files)
+- [Typing Indicator](#typing-indicator)
+- [Streaming Behavior](#streaming-behavior)
 - [Uninstallation](#uninstallation)
 - [Development](#development)
 - [License](#license)
@@ -62,12 +64,12 @@ python3 ~/.hermes/plugins/xmpp-platform/post_install.py
 
 `post_install.py` completes what the core installer intentionally leaves alone:
 
-1. Installs the plugin's Python dependencies into the plugin's own `deps/` directory (never into an externally-managed Python), skipping any that are already importable.
-2. Adds the default `platforms.xmpp` block (OMEMO on by default) and the voice/STT defaults to `config.yaml`, after backing the file up.
-3. Prompts for the bot's XMPP JID and password (existing values are shown as defaults, so press Enter to keep them or type to change them), the allowed-users allowlist (deny-all by default), and an optional avatar path.
-4. Writes the credentials, allowlist, home channel, and avatar path to `~/.hermes/.env` (secrets stay out of `config.yaml`).
+1. Sets `display.platforms.xmpp.tool_progress_grouping: separate` in `config.yaml` (after backing the file up), so tool progress arrives as one message per tool call. This is the one display default XMPP needs and that the core installer does not set.
+2. Prompts for an optional bot avatar path and writes `XMPP_AVATAR_PATH` to `~/.hermes/.env`.
 
-It is safe to re-run: existing `.env` values win, config defaults are only added when missing, and satisfied dependencies are skipped.
+Everything else is handled natively by `hermes plugins install` (credentials and Python dependencies) or by Hermes core (access control via the allowlist env var or DM pairing codes).
+
+It is safe to re-run: existing `.env` values win and config defaults are only added when missing.
 
 ### 3. Restart the gateway
 
@@ -87,18 +89,7 @@ hermes -p my-bot gateway restart
 
 Post-install reads the active profile's config and `.env`; pass `--profile my-bot` (or `--hermes-home`) if you want it explicit.
 
-### Non-interactive installation
-
-For headless setups, skip every prompt:
-
-```bash
-hermes plugins install rebelcommand/hermes-xmpp-plugin --enable
-python3 ~/.hermes/plugins/xmpp-platform/post_install.py \
-  --non-interactive \
-  --allowed-users "you@example.com"
-```
-
-Set `XMPP_USER_JID` and `XMPP_PASSWORD` in `~/.hermes/.env` yourself first (or immediately after), since the installer prompts for them only on a terminal.
+When there is no terminal, post-install sets the tool-progress key and skips the optional avatar prompt silently (keeping any existing avatar), so the same command works for headless installs with no extra flag.
 
 ## Upgrading
 
@@ -119,16 +110,16 @@ Nothing in your configuration is touched by an upgrade. Settings live in `config
 
 ## Configuration
 
-The default `platforms.xmpp` block written by `post_install.py`:
+The plugin needs no `platforms.xmpp` block in `config.yaml` by default. OMEMO is enabled in the adapter (no config key required), the platform self-enables from your credentials, and `allow_all_users` defaults to deny-all (off). The only config key `post_install.py` writes is:
 
 ```yaml
-platforms:
-  xmpp:
-    enabled: true
-    omemo_enabled: true
-    omemo_allow_untrusted: true
-    allow_all_users: false
+display:
+  platforms:
+    xmpp:
+      tool_progress_grouping: separate
 ```
+
+If you want an explicit `platforms.xmpp` block, its supported keys are `enabled`, `omemo_enabled`, `omemo_allow_untrusted`, and `allow_all_users`, though the OMEMO and access-control settings are normally set with the `.env` variables below instead.
 
 All install-specific settings (credentials, allowlist, home channel, avatar path) are stored in your Hermes `.env` file:
 
@@ -154,39 +145,22 @@ XMPP_AVATAR_PATH="/path/to/avatar.png"
 | `XMPP_OMEMO_ENABLED` | Enable OMEMO (default: true) |
 | `XMPP_OMEMO_ALLOW_UNTRUSTED` | Auto-trust new OMEMO devices (default: true) |
 | `XMPP_AVATAR_PATH` | Path to an avatar image (optional) |
-| `XMPP_HOME_CHANNEL` | Default JID for cron / notifications. Seeded at install from the first `XMPP_ALLOWED_USERS` entry; an existing value (or one set later with `/sethome`) always wins. |
+| `XMPP_HOME_CHANNEL` | Default JID for cron / notifications. Set with `/sethome` in a chat with the bot, or in `.env` yourself. |
 | `XMPP_ALLOW_PRIVATE_DOWNLOADS` | Allow inbound media to be fetched from private/link-local/loopback addresses (default: false). Set `true` only if your XMPP upload service is self-hosted on a private network. |
 
-> **Home channel note:** cron delivery and restart notifications need a home target. `post_install.py` seeds `XMPP_HOME_CHANNEL` in `.env` from the first allowlisted JID so no manual step is required. If the allowlist is empty nothing is seeded; use `/sethome` in a chat with the bot, or set the variable in `.env` yourself. `/sethome` records the home channel in `config.yaml` (core Hermes behavior for every platform); the `.env` value is what post-install and the env fallback read.
+> **Home channel note:** cron delivery and restart notifications need a home target. It is not seeded automatically. Use `/sethome` in a chat with the bot, or set `XMPP_HOME_CHANNEL` in `.env` yourself. `/sethome` records the home channel in `config.yaml` (core Hermes behavior for every platform); the `.env` value is what the env fallback reads.
 
-> **Security note:** without `XMPP_ALLOWED_USERS` and without `allow_all_users`, the bot denies every sender. The installer prompts for this explicitly rather than silently opening the agent to all users.
+> **Security note:** without `XMPP_ALLOWED_USERS` and without `allow_all_users`, the bot denies every sender until you approve them. Approve a new user by DMing the bot from an unapproved account and running `hermes pairing approve <code>` on the host, or set `XMPP_ALLOWED_USERS` in `.env`.
 
 ## OMEMO End-to-End Encryption
 
 OMEMO (XEP-0384) is enabled by default, so messages between the bot and supporting XMPP clients are end-to-end encrypted.
 
-### Requirements
-
-`slixmpp-omemo` is installed by `post_install.py`. If you set things up by hand, install it where the gateway runs:
-
-```bash
-~/.hermes/hermes-agent/venv/bin/python -m pip install slixmpp-omemo
-```
-
 ### Trust model
 
 By default the bot uses **Blind Trust Before Verification (BTBV)**: new OMEMO devices are automatically trusted so the bot can reply immediately. This is appropriate for a personal bot where you control both endpoints.
 
-To require manual trust before replying to a new device:
-
-```yaml
-platforms:
-  xmpp:
-    omemo_enabled: true
-    omemo_allow_untrusted: false
-```
-
-With manual trust, the bot logs a warning and replies to untrusted devices fail until you approve the device from your XMPP client.
+To require manual trust before replying to a new device, set `XMPP_OMEMO_ALLOW_UNTRUSTED=false` in `.env`. With manual trust, the bot logs a warning and replies to untrusted devices fail until you approve the device from your XMPP client.
 
 ### Key storage
 
@@ -194,46 +168,30 @@ OMEMO identity keys, sessions, device bundles, and trust decisions are stored in
 
 ### Disabling OMEMO
 
-Set `omemo_enabled: false` (or omit it). The adapter then uses plain-text XMPP messages and keeps working with clients that do not support OMEMO.
+Set `XMPP_OMEMO_ENABLED=false` in `.env`. The adapter then uses plain-text XMPP messages and keeps working with clients that do not support OMEMO.
 
 ## Voice and Audio
 
-`post_install.py` adds the default voice and audio configuration:
+Voice replies and transcription use the Hermes core TTS/STT configuration; the plugin adds no defaults of its own. The core defaults (STT autodetect, `voice.auto_tts: false`) apply.
 
-```yaml
-stt:
-  enabled: true
-  provider: local
-  local:
-    model: tiny
-
-voice:
-  auto_tts: false
-
-tts:
-  provider: edge
-  use_gateway: false
-```
-
-With this default the adapter transcribes inbound voice messages using Hermes core STT (`faster-whisper`) and replies with both a TTS voice message and the full text response. Text messages receive text-only replies.
+With the default the adapter transcribes inbound voice messages using Hermes core STT (`faster-whisper`) and replies with both a TTS voice message and the full text response. Text messages receive text-only replies.
 
 If you set `voice.auto_tts` to `true`, **every** reply (voice or text input) is sent as a TTS voice message in addition to the text response. The adapter-level voice reply to inbound voice messages is independent of this setting.
 
-Change the STT model or TTS provider by editing the corresponding blocks in `~/.hermes/config.yaml`. Existing settings are never overwritten.
+Change the STT model or TTS provider by editing the corresponding blocks in `~/.hermes/config.yaml`.
 
 ## Avatar
 
 The adapter publishes a bot avatar using XEP-0084 (User Avatar) and XEP-0153 (vCard-based Avatars). Most XMPP clients show this as the bot's profile picture.
 
-Provide a PNG or JPEG; the adapter crops to a centered square, resizes to 480x480, converts to PNG, and publishes through both PEP (XEP-0084) and vCard (XEP-0153) for maximum client compatibility. Configure it in `config.yaml`:
+Provide a PNG or JPEG; the adapter crops to a centered square, resizes to 480x480, converts to PNG, and publishes through both PEP (XEP-0084) and vCard (XEP-0153) for maximum client compatibility. `post_install.py` prompts for it and stores it as `XMPP_AVATAR_PATH` in `.env` (or set it there yourself):
 
-```yaml
-platforms:
-  xmpp:
-    avatar_path: "/path/to/avatar.png"
+```bash
+# ~/.hermes/.env
+XMPP_AVATAR_PATH="/path/to/avatar.png"
 ```
 
-or with `XMPP_AVATAR_PATH` in `.env`. On connect the adapter checks the server's current avatar and only publishes when it is missing or different, so restarting the gateway does not re-publish an unchanged avatar (or re-announce presence). Change the file and restart the gateway to update it.
+On connect the adapter checks the server's current avatar and only publishes when it is missing or different, so restarting the gateway does not re-publish an unchanged avatar (or re-announce presence). Change the file and restart the gateway to update it.
 
 ## Read Receipts (Chat Markers)
 
@@ -253,18 +211,21 @@ No extra configuration is required.
 
 The adapter supports XEP-0085 Chat State Notifications. While the agent generates a response your client shows a composing state; it clears when the response is sent. Enabled by default.
 
+## Streaming Behavior
+
+XMPP has no live-streaming transport, so replies arrive whole rather than streaming in as they are generated (long replies are split into ~2000-character messages). While the agent works you still see live progress: a typing indicator, one short line per tool call, and a "still working" heartbeat on long tasks.
+
 ## Uninstallation
 
+Run the cleanup script first (it is standalone), then remove the plugin, then restart:
+
 ```bash
+python3 ~/.hermes/plugins/xmpp-platform/post_uninstall.py
 hermes plugins remove xmpp-platform
 hermes gateway restart
 ```
 
-Your `config.yaml` and `.env` entries are left in place; delete the `platforms.xmpp` block and the `XMPP_*` variables if you want them gone.
-
-## Streaming Behavior
-
-XMPP's only edit primitive is XEP-0308 "Last Message Correction", a one-shot replace of the immediately previous message that cannot express the gateway's incremental streamed-edit model (and isn't wired into slixmpp's delivery path). The plugin therefore declares `SUPPORTS_MESSAGE_EDITING = False`, the same gate the WeChat, Signal, BlueBubbles, QQ, Photon, and WeCom adapters use for the same reason. The gateway then delivers each reply as exactly one message instead of attempting streamed edits (which on a platform without an edit API produces a partial preview followed by a duplicate final message). Tool progress, commentary, typing indicators, and voice replies are unaffected; they use separate delivery paths.
+`post_uninstall.py` removes the `display.platforms.xmpp.tool_progress_grouping` key, the stale `xmpp-platform` entries in `plugins.enabled`/`plugins.disabled`, and (with `--omemo`) the OMEMO key store at `sessions/omemo.json`. It deliberately leaves the `XMPP_*` variables in `.env` and any core pairing grants; it prints the commands to delete those by hand if you want them fully gone.
 
 ## Development
 
