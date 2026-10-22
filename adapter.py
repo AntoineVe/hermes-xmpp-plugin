@@ -38,24 +38,48 @@ from tools.transcription_tools import transcribe_audio
 class _AesgcmRedactingFilter(logging.Filter):
     """Defensive filter: redact aesgcm:// fragments from any log record.
 
-    Only processes records whose formatted message contains 'aesgcm'
-    (case-insensitive) to keep cost ~0 for ordinary messages. Installed on
-    the module logger so an unpatched call site can never leak an AES-GCM
-    key fragment into the logs.
+    Covers both the formatted message AND exception tracebacks (exc_info),
+    pre-formatted exception text (exc_text) and stack_info. Each field is
+    only processed when it may contain 'aesgcm' (case-insensitive) to keep
+    cost ~0 for ordinary messages. Installed on the module logger so an
+    unpatched call site can never leak an AES-GCM key fragment into the logs.
     """
 
     def filter(self, record: logging.LogRecord) -> bool:
         try:
-            # Check if the message might contain an aesgcm URL.
+            # 1. Redact the formatted message. Args are consumed by the
+            # already-formatted msg so a second pass (idempotence) yields
+            # the same string.
             msg = record.getMessage()
-            if "aesgcm" not in msg.lower():
-                return True
-            # Redact the message; args are consumed by the already-formatted
-            # msg so a second pass (idempotence) yields the same string.
-            record.msg = _redact_aesgcm_in_text(msg)
-            record.args = ()
+            if "aesgcm" in msg.lower():
+                record.msg = _redact_aesgcm_in_text(msg)
+                record.args = ()
+
+            # 2. Redact exception tracebacks. logger.exception(...)/exc_info=
+            # attach the raw exception whose text may carry an
+            # aesgcm://...#KEY URL. Format eagerly, redact, cache in
+            # exc_text and clear exc_info: standard Formatters reuse
+            # exc_text when present, so the visible stack is preserved.
+            # Never store a string in exc_info — that field expects an
+            # (type, value, traceback) tuple or None.
+            if record.exc_info:
+                exc_text = logging.Formatter().formatException(record.exc_info)
+                if "aesgcm" in exc_text.lower():
+                    exc_text = _redact_aesgcm_in_text(exc_text)
+                record.exc_text = exc_text
+                record.exc_info = None
+
+            # 3. Redact pre-formatted exception text (e.g. pre-filled by an
+            # upstream formatter or a previous pass — keeps idempotence).
+            if record.exc_text and "aesgcm" in record.exc_text.lower():
+                record.exc_text = _redact_aesgcm_in_text(record.exc_text)
+
+            # 4. Redact stack_info dumps the same way.
+            if record.stack_info and "aesgcm" in record.stack_info.lower():
+                record.stack_info = _redact_aesgcm_in_text(record.stack_info)
         except Exception:
-            # Fail-closed: drop the record rather than risk leaking.
+            # Fail-closed: drop the record rather than risk leaking the
+            # original (potentially keyed) payload.
             return False
         return True
 
@@ -2084,7 +2108,10 @@ class XMPPAdapter(BasePlatformAdapter):
                 text=_redact_aesgcm_in_text(display_text),
                 message_type=msg_type,
                 source=source,
-                raw_message=msg,
+                # Contrat vérifié : le core accepte None (gateway/platforms/event.py:55,
+                # raw_message: Any = None). Le stanza brut peut contenir des clés
+                # aesgcm:// ; ne pas le transmettre.
+                raw_message=None,
                 media_urls=media_urls,
                 media_types=media_types,
                 metadata={
