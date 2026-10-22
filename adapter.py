@@ -1572,6 +1572,11 @@ class XMPPAdapter(BasePlatformAdapter):
                 logger.info("XMPP: avatar already on server; skipping publish")
                 return
 
+            # Re-check: client may have been replaced during the server query.
+            if self.client is not client:
+                logger.info("XMPP: client changed during server avatar check; aborting publish")
+                return
+
             # Always publish vCard avatar (XEP-0153); most clients use this.
             vcard_avatar = client.plugin.get("xep_0153", None)
             if vcard_avatar is not None:
@@ -1597,6 +1602,12 @@ class XMPPAdapter(BasePlatformAdapter):
                 try:
                     avatar_id = pep_avatar.generate_id(data)
                     await asyncio.wait_for(pep_avatar.publish_avatar(data), timeout=5.0)
+
+                    # Re-check: client may have been replaced during the PEP publish.
+                    if self.client is not client:
+                        logger.info("XMPP: client changed during PEP avatar publish; aborting metadata")
+                        return
+
                     await asyncio.wait_for(pep_avatar.publish_avatar_metadata({
                         "id": avatar_id,
                         "type": "image/png",
