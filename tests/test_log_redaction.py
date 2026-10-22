@@ -691,3 +691,45 @@ class TestExtractUrlApostrophe:
             instance._extract_url("see https://host/alice's-photo.png end")
             == "https://host/alice"
         )
+
+    def test_quoted_aesgcm_url_extracted_without_quotes(self):
+        # A URL wrapped in single quotes must extract WITHOUT them: the
+        # regex swallows the closing quote, and the extra character would
+        # make _download_aesgcm reject the 89-char fragment (it must be
+        # exactly 88). Previously this URL decrypted; it must again.
+        instance = _bare_adapter()
+        url = f"aesgcm://host/f#{_KEY}"
+        assert instance._extract_url(f"see '{url}' end") == url
+
+    def test_bare_quoted_aesgcm_url_extracted_without_quotes(self):
+        # Same as above with the quoted URL as the whole body (no leading
+        # word: the regex then starts matching at the scheme itself).
+        instance = _bare_adapter()
+        url = f"aesgcm://host/f#{_KEY}"
+        assert instance._extract_url(f"'{url}'") == url
+
+    def test_internal_apostrophe_not_stripped_as_enclosing_quote(self):
+        # Only ENCLOSING quotes are removed: an apostrophe inside the URL
+        # path (alice's-photo.png) must survive extraction untouched.
+        instance = _bare_adapter()
+        url = f"aesgcm://host/alice's-photo.png#{_KEY}"
+        assert instance._extract_url(url) == url
+
+    def test_quoted_aesgcm_url_fragment_is_exactly_88_chars(self):
+        # End-to-end guard for the _download_aesgcm length check: the
+        # extracted fragment of a quoted URL is 88 chars — the closing
+        # quote is NOT part of it.
+        instance = _bare_adapter()
+        fragment = _KEY + "0" * (88 - len(_KEY))
+        url = f"aesgcm://host/f#{fragment}"
+        extracted = instance._extract_url(f"'{url}'")
+        assert len(extracted.split("#", 1)[1]) == 88
+        assert extracted.split("#", 1)[1] == fragment
+
+    def test_quoted_https_url_extracted_without_quotes(self):
+        # The enclosing-quote strip covers the https branch too.
+        instance = _bare_adapter()
+        assert (
+            instance._extract_url("see 'https://host/photo.png' end")
+            == "https://host/photo.png"
+        )

@@ -1610,9 +1610,9 @@ class XMPPAdapter(BasePlatformAdapter):
         # legal URL-path characters (e.g. alice's-photo.png) and stopping
         # there would strand the keyed fragment in the body, which the
         # URL->media-path replacement in _on_message would then re-expose.
-        # A URL wrapped in single quotes therefore downloads with its
-        # closing quote inside the fragment and fails safe (no media,
-        # redacted text).
+        # A URL wrapped in single quotes therefore swallows its closing
+        # quote into the match; the enclosing-quote strip below removes it
+        # so the key fragment keeps its required 88-character length.
         match = re.search(
             r"https?://[^\s<>\"')\]}]+|aesgcm://[^\s<>\")\]}]+",
             text,
@@ -1620,6 +1620,21 @@ class XMPPAdapter(BasePlatformAdapter):
         if not match:
             return None
         url = match.group(0)
+        # Strip the closing single quote of a URL enclosed in quotes (e.g.
+        # 'aesgcm://host/f#KEY' -> aesgcm://host/f#KEY) while keeping
+        # internal apostrophes (e.g. alice's-photo.png) untouched: the
+        # extra character would corrupt the key fragment (89 chars instead
+        # of 88) and make _download_aesgcm reject a decryptable URL. The
+        # regex always starts at the scheme, so only the trailing quote can
+        # end up inside the match; the URL is treated as enclosed when the
+        # character right before the match is a quote too.
+        if (
+            len(url) >= 2
+            and url.endswith("'")
+            and match.start() > 0
+            and text[match.start() - 1] == "'"
+        ):
+            url = url[:-1]
         return url.rstrip(".,;:!?")
 
     # -- Avatar --------------------------------------------------------------
