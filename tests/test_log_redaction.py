@@ -733,3 +733,32 @@ class TestExtractUrlApostrophe:
             instance._extract_url("see 'https://host/photo.png' end")
             == "https://host/photo.png"
         )
+
+    def test_quoted_aesgcm_url_with_trailing_period(self):
+        # A quoted URL followed by sentence punctuation: the period hides
+        # the closing quote from the endswith("'") check, so punctuation
+        # must be stripped BEFORE the enclosing-quote check.
+        instance = _bare_adapter()
+        url = f"aesgcm://host/f#{_KEY}"
+        assert instance._extract_url(f"'{url}'.") == url
+
+    def test_quoted_aesgcm_url_with_trailing_comma(self):
+        instance = _bare_adapter()
+        url = f"aesgcm://host/f#{_KEY}"
+        assert instance._extract_url(f"'{url}',") == url
+
+    def test_quoted_aesgcm_url_with_trailing_exclamation(self):
+        instance = _bare_adapter()
+        url = f"aesgcm://host/f#{_KEY}"
+        assert instance._extract_url(f"'{url}'!") == url
+
+    def test_quoted_aesgcm_url_fragment_valid_after_punctuation(self):
+        # End-to-end guard for the _download_aesgcm length check: after
+        # punctuation + enclosing-quote stripping, the fragment is exactly
+        # the 88 chars the decrypt requires — no quote, no punctuation.
+        instance = _bare_adapter()
+        fragment = _KEY + "0" * (88 - len(_KEY))
+        url = f"aesgcm://host/f#{fragment}"
+        extracted = instance._extract_url(f"'{url}'.")
+        assert extracted.split("#", 1)[1] == fragment
+        assert len(extracted.split("#", 1)[1]) == 88

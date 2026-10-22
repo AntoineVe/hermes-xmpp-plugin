@@ -1627,7 +1627,12 @@ class XMPPAdapter(BasePlatformAdapter):
         # of 88) and make _download_aesgcm reject a decryptable URL. The
         # regex always starts at the scheme, so only the trailing quote can
         # end up inside the match; the URL is treated as enclosed when the
-        # character right before the match is a quote too.
+        # character right before the match is a quote too. Trailing
+        # punctuation is stripped BEFORE the quote check because a quoted
+        # URL followed by sentence punctuation (e.g. 'aesgcm://host/f#KEY'.)
+        # hides the quote behind it; punctuation is re-stripped afterward in
+        # case more of it followed the quote inside the match.
+        url = url.rstrip(".,;:!?")
         if (
             len(url) >= 2
             and url.endswith("'")
