@@ -1996,10 +1996,10 @@ class XMPPAdapter(BasePlatformAdapter):
             # admits WhatsApp-shaped metadata through native admission; any other
             # non-empty metadata dict is refused with invalid_params, which drops
             # the message before the agent ever sees it. The XMPP-specific keys
-            # below are not consumed by the core — log them and send an empty dict
-            # so the event passes admission on every platform.
+            # below are not consumed by the core — debug-log them and send an
+            # empty dict so the event passes admission on every platform.
             if encrypted or media_path or url:
-                logger.info(
+                logger.debug(
                     "XMPP: message metadata (logged, not passed to gateway): "
                     "encrypted=%s media_url=%s media_path=%s",
                     encrypted,
