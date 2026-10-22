@@ -10,14 +10,22 @@ transcription helper, which are not installable in the test environment.
 Lightweight stubs are installed first so the module-level helpers can be
 imported; if the real framework is importable, the stubs are skipped.
 
-Driving the full ``_on_message`` path would require a wired-up slixmpp
-client, so the call sites themselves are pinned by source assertions:
-they must route through the redaction helpers.
+The behavioral tests below drive the smallest units that emit each log
+(``_download_url`` / ``_download_aesgcm``, ``_on_message``, ``send``) with
+``object.__new__(XMPPAdapter)`` instances plus lightweight stubs, capture the
+real records with pytest's ``caplog`` and assert the sentinel key never
+appears. ``_on_message`` is additionally driven end-to-end to pin the agent
+boundary: ``MessageEvent.text`` must only ever carry the redacted form,
+``raw_message`` must stay ``None``, while the downloader still receives the
+original keyed URL.
 """
 
+import asyncio
+import logging
 import sys
 import time
 import types
+import xml.etree.ElementTree as ET
 from pathlib import Path
 
 import pytest
@@ -280,21 +288,277 @@ class TestLogSafeUrl:
         assert _KEY not in once
 
 
-class TestCallSitesRedactKeys:
-    """Pin the leak-prone call sites to the redaction helpers.
+# ---------------------------------------------------------------------------
+# Behavioral drivers (caplog + agent boundary)
+# ---------------------------------------------------------------------------
 
-    A full behavioral test would need a wired-up slixmpp client; these
-    source assertions guarantee the regression cannot silently come back.
+
+class _CapturedEvent:
+    """Stand-in for gateway ``MessageEvent``: captures constructor kwargs."""
+
+    def __init__(self, **kwargs):
+        self.__dict__.update(kwargs)
+
+
+class _FakeSendResult:
+    """Stand-in for gateway ``SendResult``: captures constructor kwargs."""
+
+    def __init__(self, **kwargs):
+        self.__dict__.update(kwargs)
+
+
+class _FakeMessage:
+    """Minimal slixmpp ``Message`` stand-in for ``_on_message``."""
+
+    def __init__(self, body="", oob_url=None, mtype="chat",
+                 frm="alice@example.com/phone"):
+        self._type = mtype
+        self._from = frm
+        self._body = body
+        self.xml = ET.Element("{jabber:client}message")
+        if oob_url:
+            oob = ET.SubElement(self.xml, "{jabber:x:oob}x")
+            url_el = ET.SubElement(oob, "{jabber:x:oob}url")
+            url_el.text = oob_url
+
+    def __getitem__(self, key):
+        if key == "type":
+            return self._type
+        if key == "from":
+            return self._from
+        raise KeyError(key)
+
+    def get(self, key, default=None):
+        if key == "type":
+            return self._type
+        if key == "body":
+            return self._body
+        return default
+
+
+def _bare_adapter():
+    """XMPPAdapter skeleton with only the attributes the drivers touch."""
+    instance = object.__new__(adapter.XMPPAdapter)
+    instance._http = None
+    instance._last_resources = {}
+    instance._omemo_chats = set()
+    instance.omemo_enabled = False
+    instance._voice_reply_chats = {}
+    instance.client = None  # _omemo_plugin() -> None: OMEMO path skipped
+    instance.user_jid = "bot@example.com/hermes"
+    return instance
+
+
+def _message_adapter(monkeypatch, download=object()):
+    """Adapter wired for ``_on_message``; returns ``(adapter, events)``.
+
+    ``download`` is what the stubbed ``_download_aesgcm`` returns; the spy
+    records every URL it was called with on ``adapter._received_download_urls``.
+    """
+    monkeypatch.setattr(adapter, "MessageEvent", _CapturedEvent)
+    instance = _bare_adapter()
+    events = []
+
+    async def _capture(event):
+        events.append(event)
+
+    instance.handle_message = _capture
+    instance.build_source = lambda **kwargs: dict(kwargs)
+    instance._cache_media = (
+        lambda data, kind="image", ext=None: f"/cache/{kind}.bin"
+    )
+
+    received_urls = []
+
+    async def _spy_download(url):
+        received_urls.append(url)
+        return download
+
+    instance._download_aesgcm = _spy_download
+    instance._received_download_urls = received_urls
+    return instance, events
+
+
+class TestLogCallSitesRedactKeys:
+    """caplog-based behavioral tests for every leak-prone log call site.
+
+    Each test drives the smallest unit that emits the log and asserts the
+    sentinel key never reaches the captured records. For the call-site tests
+    the defensive ``_AesgcmRedactingFilter`` is stripped: with the filter
+    active it would mask any call-site regression, so isolating it makes a
+    reverted call-site redaction detectable. The filter itself is exercised
+    by the last two tests.
     """
 
-    source = (REPO_ROOT / "adapter.py").read_text(encoding="utf-8")
+    @pytest.fixture
+    def no_redacting_filter(self, monkeypatch):
+        monkeypatch.setattr(adapter.logger, "filters", [])
 
-    def test_download_failure_warning_is_redacted(self):
-        assert 'logger.warning("XMPP: failed to download media from %s", _log_safe_url(url))' in self.source
-        assert 'logger.warning("XMPP: failed to download media from %s", url)' not in self.source
+    @staticmethod
+    def _debug(caplog):
+        caplog.set_level(logging.DEBUG, logger=adapter.logger.name)
 
-    def test_body_debug_log_is_redacted(self):
-        assert "_redact_aesgcm_in_text(body)" in self.source
+    def test_download_url_failure_redacts_keyed_exception(
+        self, caplog, no_redacting_filter, monkeypatch
+    ):
+        self._debug(caplog)
+        monkeypatch.setattr(adapter, "_is_blocked_ssrf_url", lambda url: False)
 
-    def test_display_text_debug_log_is_redacted(self):
-        assert "_redact_aesgcm_in_text(display_text)" in self.source
+        class _ExplodingHttp:
+            async def get(self, url):
+                raise RuntimeError(f"dial aesgcm://host/f#{_KEY} failed")
+
+        instance = _bare_adapter()
+        instance._http = _ExplodingHttp()
+        data = asyncio.run(
+            instance._download_url("https://upload.example.com/file.aesgcm")
+        )
+        assert data is None
+        assert "XMPP: failed to download" in caplog.text
+        assert _KEY not in caplog.text
+
+    def test_download_aesgcm_failure_redacts_url(
+        self, caplog, no_redacting_filter
+    ):
+        self._debug(caplog)
+        # 88-char fragment carrying the sentinel: fromhex fails on the
+        # non-hex sentinel characters, so the warning path logs the URL.
+        fragment = _KEY + "0" * (88 - len(_KEY))
+        url = f"aesgcm://upload.example.com/file.aesgcm#{fragment}"
+        data = asyncio.run(_bare_adapter()._download_aesgcm(url))
+        assert data is None
+        assert "XMPP: failed to decrypt aesgcm" in caplog.text
+        assert _KEY not in caplog.text
+
+    def test_on_message_body_debug_redacted(
+        self, caplog, no_redacting_filter, monkeypatch
+    ):
+        self._debug(caplog)
+        instance, _events = _message_adapter(monkeypatch, download=b"image-bytes")
+        asyncio.run(
+            instance._on_message(_FakeMessage(body=f"see aesgcm://host/f#{_KEY} end"))
+        )
+        assert "XMPP: _on_message body=" in caplog.text
+        assert _KEY not in caplog.text
+
+    def test_on_message_display_text_debug_redacted(
+        self, caplog, no_redacting_filter, monkeypatch
+    ):
+        self._debug(caplog)
+        # Failure path: the URL is NOT replaced by a media path in
+        # display_text, so the raw keyed URL would leak here if the
+        # call-site redaction were reverted.
+        instance, _events = _message_adapter(monkeypatch, download=None)
+        asyncio.run(
+            instance._on_message(_FakeMessage(body=f"aesgcm://host/f#{_KEY}"))
+        )
+        assert "about to handle_message" in caplog.text
+        assert _KEY not in caplog.text
+
+    def test_send_debug_redacted(self, caplog, no_redacting_filter, monkeypatch):
+        self._debug(caplog)
+        monkeypatch.setattr(adapter, "SendResult", _FakeSendResult)
+        result = asyncio.run(
+            _bare_adapter().send(
+                "alice@example.com", f"aesgcm://host/f#{_KEY} please check"
+            )
+        )
+        assert result.success is False
+        assert "XMPP: send() called" in caplog.text
+        assert _KEY not in caplog.text
+
+    def test_redacting_filter_scrubs_exc_info_traceback(self, caplog):
+        # The defensive filter stays installed: even an unredacted call site
+        # must never leak the key through an attached traceback.
+        self._debug(caplog)
+        try:
+            raise ValueError(f"decrypt failed for aesgcm://host/f#{_KEY}")
+        except ValueError:
+            logging.getLogger(adapter.logger.name).warning(
+                "media fetch blew up", exc_info=True
+            )
+        assert "media fetch blew up" in caplog.text
+        assert "Traceback (most recent call last)" in caplog.text
+        assert "ValueError" in caplog.text  # exception type preserved
+        assert _KEY not in caplog.text
+
+    def test_logger_exception_redacts_keyed_traceback(self, caplog):
+        self._debug(caplog)
+        try:
+            raise ValueError(f"aesgcm://host/f#{_KEY} exploded")
+        except ValueError as exc:
+            logging.getLogger(adapter.logger.name).exception(
+                "test", exc_info=(ValueError, exc, exc.__traceback__)
+            )
+        assert "Traceback (most recent call last)" in caplog.text
+        assert _KEY not in caplog.text
+
+
+class TestAgentBoundary:
+    """``MessageEvent.text`` is the agent boundary: redacted form only.
+
+    Drives the full ``_on_message`` path with a ``object.__new__(XMPPAdapter)``
+    instance, a fake slixmpp message and a ``handle_message`` spy. The
+    downloader spy proves the *original* keyed URL still reaches the media
+    pipeline while the agent-facing text and metadata only ever carry the
+    redacted form.
+    """
+
+    def test_download_success_downloader_sees_original_url_text_redacted(
+        self, monkeypatch
+    ):
+        instance, events = _message_adapter(monkeypatch, download=b"fake image bytes")
+        original_url = f"aesgcm://host/f#{_KEY}"
+        asyncio.run(
+            instance._on_message(_FakeMessage(body=f"see {original_url} end"))
+        )
+        # The media pipeline received the ORIGINAL url (key fragment included).
+        assert instance._received_download_urls == [original_url]
+        assert len(events) == 1
+        event = events[0]
+        # ... but the agent only sees the redacted form.
+        assert _KEY not in event.text
+        assert event.text == "see /cache/image.bin end"
+        assert event.media_urls == ["/cache/image.bin"]
+        assert _KEY not in (event.metadata.get("media_url") or "")
+        assert event.raw_message is None
+
+    def test_download_failure_text_redacted(self, monkeypatch):
+        instance, events = _message_adapter(monkeypatch, download=None)
+        asyncio.run(instance._on_message(_FakeMessage(body=f"aesgcm://host/f#{_KEY}")))
+        assert len(events) == 1
+        event = events[0]
+        assert _KEY not in event.text
+        assert "<redacted>" in event.text
+        assert event.message_type == adapter.MessageType.TEXT
+        assert _KEY not in (event.metadata.get("media_url") or "")
+        assert event.raw_message is None
+
+    def test_oob_only_url_text_redacted(self, monkeypatch):
+        instance, events = _message_adapter(monkeypatch, download=b"fake image bytes")
+        asyncio.run(
+            instance._on_message(
+                _FakeMessage(body="", oob_url=f"aesgcm://host/f#{_KEY}")
+            )
+        )
+        assert len(events) == 1
+        event = events[0]
+        assert _KEY not in event.text
+        assert event.metadata.get("media_path") == "/cache/image.bin"
+        assert _KEY not in (event.metadata.get("media_url") or "")
+        assert event.raw_message is None
+
+    def test_plain_text_byte_identical_no_media(self, monkeypatch):
+        instance, events = _message_adapter(monkeypatch)
+        asyncio.run(instance._on_message(_FakeMessage(body="hello world")))
+        assert len(events) == 1
+        event = events[0]
+        assert event.text == "hello world"
+        assert event.media_urls == []
+        assert event.media_types == []
+        assert event.metadata.get("media_url") is None
+        assert event.metadata.get("media_path") is None
+        assert event.metadata.get("encrypted") is False
+        assert event.raw_message is None
+        # No downloader was invoked for plain text.
+        assert instance._received_download_urls == []
