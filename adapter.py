@@ -35,6 +35,7 @@ from slixmpp.plugins.base import register_plugin
 from slixmpp.stanza import Message
 from tools.transcription_tools import transcribe_audio
 
+
 class _AesgcmRedactingFilter(logging.Filter):
     """Defensive filter: redact aesgcm:// fragments from any log record.
 
