@@ -191,6 +191,27 @@ class TestRedactAesgcmInText:
         assert adapter._redact_aesgcm_in_text(once) == once
         assert _KEY not in once
 
+    def test_apostrophe_in_path_is_redacted(self):
+        # The apostrophe is a legal URL-path character: the match must not
+        # stop at it, or the fragment (and its key) would survive.
+        text = f"see aesgcm://host/alice's-photo.png#{_KEY} now"
+        result = adapter._redact_aesgcm_in_text(text)
+        assert _KEY not in result
+        assert "alice's-photo.png#<redacted>" in result
+
+    def test_url_in_single_quotes_is_redacted(self):
+        # A URL wrapped in single quotes: the closing quote is swallowed
+        # into the masked fragment fail-closed — the key must not survive.
+        text = f"'aesgcm://host/f#{_KEY}'"
+        result = adapter._redact_aesgcm_in_text(text)
+        assert _KEY not in result
+
+    def test_apostrophe_idempotent(self):
+        text = f"aesgcm://host/alice's-photo.png#{_KEY}"
+        once = adapter._redact_aesgcm_in_text(text)
+        assert adapter._redact_aesgcm_in_text(once) == once
+        assert _KEY not in once
+
     def test_large_text_with_many_urls_redacted_quickly(self):
         # 200 KB of text carrying 50 keyed URLs must redact in < 2 seconds.
         padding = "x" * (200 * 1024 // 50)
@@ -441,6 +462,21 @@ class TestLogCallSitesRedactKeys:
         assert "XMPP: _on_message body=" in caplog.text
         assert _KEY not in caplog.text
 
+    def test_on_message_body_apostrophe_url_redacted(
+        self, caplog, no_redacting_filter, monkeypatch
+    ):
+        # The apostrophe in the URL path must not stop the redaction
+        # before the keyed fragment.
+        self._debug(caplog)
+        instance, _events = _message_adapter(monkeypatch, download=b"image-bytes")
+        asyncio.run(
+            instance._on_message(
+                _FakeMessage(body=f"see aesgcm://host/alice's-photo.png#{_KEY} end")
+            )
+        )
+        assert "XMPP: _on_message body=" in caplog.text
+        assert _KEY not in caplog.text
+
     def test_on_message_display_text_debug_redacted(
         self, caplog, no_redacting_filter, monkeypatch
     ):
@@ -534,6 +570,20 @@ class TestAgentBoundary:
         assert _KEY not in (event.metadata.get("media_url") or "")
         assert event.raw_message is None
 
+    def test_agent_text_apostrophe_url_redacted(self, monkeypatch):
+        # Agent boundary: an apostrophe inside the URL path must not let
+        # the keyed fragment leak into MessageEvent.text.
+        instance, events = _message_adapter(monkeypatch, download=None)
+        asyncio.run(
+            instance._on_message(
+                _FakeMessage(body=f"aesgcm://host/alice's-photo.png#{_KEY}")
+            )
+        )
+        assert len(events) == 1
+        event = events[0]
+        assert _KEY not in event.text
+        assert "<redacted>" in event.text
+
     def test_oob_only_url_text_redacted(self, monkeypatch):
         instance, events = _message_adapter(monkeypatch, download=b"fake image bytes")
         asyncio.run(
@@ -562,3 +612,82 @@ class TestAgentBoundary:
         assert event.raw_message is None
         # No downloader was invoked for plain text.
         assert instance._received_download_urls == []
+
+
+class TestFilterDeduplication:
+    """The filter install guard must dedupe across module reloads.
+
+    ``logging.getLogger()`` returns the same singleton while a reload
+    rebinds ``_AesgcmRedactingFilter`` to a fresh class object, so the
+    guard keys on the reload-stable class NAME — an ``isinstance()``
+    check would miss the reloaded class and stack duplicate filters.
+    """
+
+    def test_filter_deduplication_survives_reload(self, monkeypatch):
+        """Simulating a reload: re-running the install guard must not add
+        a second redacting filter to the module logger."""
+        # Work on a copy of the shared logger's filter list so a broken
+        # guard cannot permanently pollute other tests.
+        monkeypatch.setattr(
+            adapter.logger, "filters", list(adapter.logger.filters)
+        )
+        initial_count = sum(
+            1
+            for f in adapter.logger.filters
+            if type(f).__name__ == "_AesgcmRedactingFilter"
+        )
+        assert initial_count >= 1
+
+        # The module-level install guard, exactly as executed at import
+        # time (i.e. re-run after every reload).
+        if not any(
+            type(f).__name__ == "_AesgcmRedactingFilter"
+            for f in adapter.logger.filters
+        ):
+            adapter.logger.addFilter(adapter._AesgcmRedactingFilter())
+
+        final_count = sum(
+            1
+            for f in adapter.logger.filters
+            if type(f).__name__ == "_AesgcmRedactingFilter"
+        )
+        assert initial_count == final_count
+
+    def test_fresh_class_object_is_deduped_by_name(self):
+        """A fresh (reload-style) class object with the same name must be
+        recognized by the guard: isinstance() returns False here — the
+        exact regression this name-based replacement fixes."""
+        class _AesgcmRedactingFilter(logging.Filter):
+            pass
+
+        fresh_instance = _AesgcmRedactingFilter()
+        assert not isinstance(fresh_instance, adapter._AesgcmRedactingFilter)
+        # The name-based guard recognizes the reloaded-style instance, so
+        # the install guard would NOT stack a duplicate filter.
+        assert any(
+            type(f).__name__ == "_AesgcmRedactingFilter"
+            for f in [fresh_instance]
+        )
+
+
+class TestExtractUrlApostrophe:
+    """``_extract_url`` must capture the FULL keyed ``aesgcm://`` URL.
+
+    The apostrophe is a legal URL-path character: stopping there strands
+    the keyed fragment in the body, and the URL->media-path replacement in
+    ``_on_message`` would then re-expose it in ``MessageEvent.text``.
+    """
+
+    def test_apostrophe_in_path_extracts_full_keyed_url(self):
+        instance = _bare_adapter()
+        url = f"aesgcm://host/alice's-photo.png#{_KEY}"
+        assert instance._extract_url(f"see {url} end") == url
+
+    def test_https_extraction_unchanged_by_apostrophe(self):
+        instance = _bare_adapter()
+        # https URLs carry no key fragment: their existing terminator set
+        # (including the apostrophe) is deliberately left untouched.
+        assert (
+            instance._extract_url("see https://host/alice's-photo.png end")
+            == "https://host/alice"
+        )

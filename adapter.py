@@ -86,8 +86,11 @@ class _AesgcmRedactingFilter(logging.Filter):
 
 logger = logging.getLogger(__name__)
 # Install at most once: logging.getLogger() returns the same singleton across
-# module reloads, so a naive addFilter() would stack duplicate filters.
-if not any(isinstance(_existing_filter, _AesgcmRedactingFilter) for _existing_filter in logger.filters):
+# module reloads, so a naive addFilter() would stack duplicate filters. The
+# dedup check compares the class NAME instead of isinstance(): a reload
+# rebinds _AesgcmRedactingFilter to a fresh class object that isinstance()
+# no longer recognizes, whereas the name is reload-stable.
+if not any(type(_existing_filter).__name__ == "_AesgcmRedactingFilter" for _existing_filter in logger.filters):
     logger.addFilter(_AesgcmRedactingFilter())
 
 # XMPP servers and clients choke on very large stanzas, so send() splits every
@@ -311,17 +314,28 @@ def _log_safe_url(url: str) -> str:
 
 
 # ``aesgcm://`` URLs can be embedded inline in message bodies or display
-# texts; capture each URL up to the next whitespace or quote. Angle brackets
-# are deliberately NOT excluded so an already-redacted fragment
+# texts; capture each URL up to the next whitespace or double quote. The
+# apostrophe is deliberately NOT excluded: it is a legal character inside
+# URL paths (e.g. ``alice's-photo.png``), and stopping there would leave
+# the fragment — and its key — unredacted. A URL wrapped in single quotes
+# therefore swallows its closing ``'`` into the masked fragment
+# fail-closed, which is acceptable (the key is what must not survive).
+# Angle brackets are also NOT excluded so an already-redacted fragment
 # (``#<redacted>``) is consumed as a single match, keeping the redaction
 # idempotent; any extra trailing characters are swallowed fail-closed.
 # ``*`` (not ``+``) also catches a bare ``aesgcm://`` or ``aesgcm://#KEY``,
 # and ``re.IGNORECASE`` covers odd-cased schemes like ``AESGCM://``.
-_AESGCM_URL_RE = re.compile(r"aesgcm://[^\s\"']*", re.IGNORECASE)
+_AESGCM_URL_RE = re.compile(r"aesgcm://[^\s\"]*", re.IGNORECASE)
 
 
 def _redact_aesgcm_in_text(text: str) -> str:
-    """Redact AES-GCM key fragments from every ``aesgcm://`` URL in text."""
+    """Redact AES-GCM key fragments from every ``aesgcm://`` URL in text.
+
+    Known edge case: a malformed URL with whitespace before its fragment
+    (``aesgcm://host/file #KEY``) stops the textual match at the space, so
+    such fragments are NOT covered by this redaction (the defensive log
+    filter may still scrub simple cases).
+    """
     if not text:
         return text
     return _AESGCM_URL_RE.sub(lambda m: _redact_aesgcm_url(m.group(0)), text)
@@ -1591,7 +1605,17 @@ class XMPPAdapter(BasePlatformAdapter):
         # brackets/quotes that are not part of the URL. The period is kept in
         # the match because it is a legitimate URL character (domain names and
         # file extensions); only a trailing period is removed afterward.
-        match = re.search(r"https?://[^\s<>\"')\]}]+|aesgcm://[^\s<>\"')\]}]+", text)
+        # The aesgcm alternative deliberately allows apostrophes: they are
+        # legal URL-path characters (e.g. alice's-photo.png) and stopping
+        # there would strand the keyed fragment in the body, which the
+        # URL->media-path replacement in _on_message would then re-expose.
+        # A URL wrapped in single quotes therefore downloads with its
+        # closing quote inside the fragment and fails safe (no media,
+        # redacted text).
+        match = re.search(
+            r"https?://[^\s<>\"')\]}]+|aesgcm://[^\s<>\")\]}]+",
+            text,
+        )
         if not match:
             return None
         url = match.group(0)
