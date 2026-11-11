@@ -1030,6 +1030,10 @@ class XMPPAdapter(BasePlatformAdapter):
         msg["id"] = self.client.new_id()
 
         self._attach_oob_url(msg, url)
+        self._attach_file_sharing(
+            msg, url, filename, len(audio_bytes), content_type,
+            encrypted=url.startswith("aesgcm://"),
+        )
         return await self._send_media_stanza(msg, recipient, "voice message")
 
     async def send_image_file(
@@ -1070,6 +1074,10 @@ class XMPPAdapter(BasePlatformAdapter):
         msg["id"] = self.client.new_id()
 
         self._attach_oob_url(msg, url)
+        self._attach_file_sharing(
+            msg, url, filename, len(image_bytes), content_type,
+            encrypted=url.startswith("aesgcm://"),
+        )
         return await self._send_media_stanza(msg, recipient, "image")
 
 
@@ -1078,11 +1086,10 @@ class XMPPAdapter(BasePlatformAdapter):
         """Attach an XEP-0066 Out-of-Band Data element to a media stanza.
 
         Marks the http(s) URL in the body as a media attachment (rather than a
-        clickable link) so clients inline it. Replaces the former XEP-0447
-        stateless-file-sharing block, which was Experimental and emitted
-        spec-noncompliant XML. ``aesgcm://`` URLs are deliberately left alone:
-        XEP-0454 specifies no such annotation for them. Best-effort; failures
-        fall back to the plain URL body.
+        clickable link) so clients inline it. ``aesgcm://`` URLs are left alone
+        for the OOB element (XEP-0454 specifies no such annotation for them) but
+        still get the XEP-0447 file-sharing block. Best-effort; failures fall
+        back to the plain URL body.
         """
         if not url.startswith(("http://", "https://")):
             return
@@ -1093,6 +1100,50 @@ class XMPPAdapter(BasePlatformAdapter):
             msg.xml.append(x)
         except Exception as exc:
             logger.debug("XMPP: could not attach OOB URL: %s", exc)
+
+    def _attach_file_sharing(
+        self,
+        msg,
+        url: str,
+        filename: str,
+        size: int,
+        content_type: str,
+        *,
+        encrypted: bool = False,
+    ) -> None:
+        """Attach a XEP-0447 stateless-file-sharing block so clients that support
+        SIMS (Conversations, Dino, ...) render the media inline (voice bubble for
+        audio) instead of showing the body as a plain link.
+
+        For plain http(s) URLs the source is a url-data element; for aesgcm://
+        (XEP-0454 OMEMO media) the url-data target is the aesgcm URL itself, which
+        carries the IV+key in its fragment. A XEP-0428 fallback indicator is added
+        when the body is the URL, plus the XEP-0372 reference wrapper recommended by
+        XEP-0447. Best-effort: any failure leaves the plain body.
+        """
+        try:
+            ns_sfs = "urn:xmpp:sfs:0"
+            fs = ET.Element("{" + ns_sfs + "}file-sharing", {"disposition": "inline"})
+            file_el = ET.SubElement(fs, "{urn:xmpp:file:metadata:0}file")
+            ET.SubElement(file_el, "{urn:xmpp:file:metadata:0}media-type").text = content_type
+            ET.SubElement(file_el, "{urn:xmpp:file:metadata:0}name").text = filename
+            ET.SubElement(file_el, "{urn:xmpp:file:metadata:0}size").text = str(size)
+            sources = ET.SubElement(fs, "{urn:xmpp:sfs:0}sources")
+            ET.SubElement(
+                sources, "{http://jabber.org/protocol/url-data}url-data", {"target": url}
+            )
+            ref = ET.Element("{urn:xmpp:reference:0}reference", {"type": "data"})
+            ref.append(fs)
+            msg.xml.append(ref)
+            # XEP-0428 fallback: the body carries the URL as legacy fallback.
+            try:
+                fb = ET.Element("{urn:xmpp:fallback:0}fallback", {"for": ns_sfs})
+                ET.SubElement(fb, "{urn:xmpp:fallback:0}body")
+                msg.xml.append(fb)
+            except Exception:
+                pass
+        except Exception as exc:
+            logger.debug("XMPP: could not attach file-sharing block: %s", exc)
 
     async def _send_media_stanza(self, msg, recipient: JID, kind_label: str) -> SendResult:
         """Send a media stanza, encrypting for OMEMO-active chats and refusing a plaintext downgrade.
@@ -1530,7 +1581,14 @@ class XMPPAdapter(BasePlatformAdapter):
             return False
 
     async def _publish_avatar(self) -> None:
-        if not self.avatar_path or self.client is None:
+        # Fix 2026-10-22: capture the client reference locally to avoid a race
+        # where self.client becomes None (via _cleanup_client) during await
+        # to_thread. Without this, self.client.plugin.get() raised
+        # AttributeError 'NoneType', and on Prosody with
+        # c2s_stanza_size_limit=256KiB (default), an oversized vCard stanza
+        # made the server close the stream -> infinite reconnect loop.
+        client = self.client
+        if not self.avatar_path or client is None:
             return
         try:
             path = Path(self.avatar_path)
@@ -1542,6 +1600,25 @@ class XMPPAdapter(BasePlatformAdapter):
             # a large source image cannot stall the gateway loop during startup.
             data, width, height = await asyncio.to_thread(self._prepare_avatar_bytes, path)
 
+            # Re-check: the client may have been replaced/nulled during to_thread.
+            if self.client is not client:
+                logger.info("XMPP: client changed during avatar prep; aborting publish")
+                return
+
+            # Fix 2026-10-22: size guard. If the base64 avatar exceeds 200 KiB,
+            # the server (Prosody default 256 KiB c2s_stanza_size_limit) will
+            # reject the stanza and close the stream -> reconnect loop. Log and
+            # skip publishing rather than risk it.
+            import base64 as _b64
+            b64_size = len(_b64.b64encode(data))
+            if b64_size > 200 * 1024:
+                logger.warning(
+                    "XMPP: avatar too large (%d KiB base64 > 200 KiB), "
+                    "skipping publish to avoid server policy-violation",
+                    b64_size // 1024,
+                )
+                return
+
             # Ask the server whether it already has this exact avatar. When it
             # does there is nothing to publish: republishing on every start is
             # what produced the duplicate "bot is online" toast (set_avatar's
@@ -1550,8 +1627,13 @@ class XMPPAdapter(BasePlatformAdapter):
                 logger.info("XMPP: avatar already on server; skipping publish")
                 return
 
+            # Re-check: client may have been replaced during the server query.
+            if self.client is not client:
+                logger.info("XMPP: client changed during server avatar check; aborting publish")
+                return
+
             # Always publish vCard avatar (XEP-0153); most clients use this.
-            vcard_avatar = self.client.plugin.get("xep_0153", None)
+            vcard_avatar = client.plugin.get("xep_0153", None)
             if vcard_avatar is not None:
                 try:
                     await asyncio.wait_for(
@@ -1564,12 +1646,23 @@ class XMPPAdapter(BasePlatformAdapter):
             else:
                 logger.warning("XMPP: xep_0153 plugin not available")
 
+            # Re-check client identity before PEP publish (avoid crash if None).
+            if self.client is not client:
+                logger.info("XMPP: client changed during vCard publish; aborting PEP")
+                return
+
             # Try PEP/XEP-0084 second (best effort, can hang on some servers).
-            pep_avatar = self.client.plugin.get("xep_0084", None)
+            pep_avatar = client.plugin.get("xep_0084", None)
             if pep_avatar is not None:
                 try:
                     avatar_id = pep_avatar.generate_id(data)
                     await asyncio.wait_for(pep_avatar.publish_avatar(data), timeout=5.0)
+
+                    # Re-check: client may have been replaced during the PEP publish.
+                    if self.client is not client:
+                        logger.info("XMPP: client changed during PEP avatar publish; aborting metadata")
+                        return
+
                     await asyncio.wait_for(pep_avatar.publish_avatar_metadata({
                         "id": avatar_id,
                         "type": "image/png",
@@ -1601,11 +1694,15 @@ class XMPPAdapter(BasePlatformAdapter):
         left = (width - side) // 2
         top = (height - side) // 2
         img = img.crop((left, top, left + side, top + side))
+        # Fix 2026-10-22: 256x256 instead of 480x480. An XMPP avatar does not
+        # need to be larger, and the resulting base64 size (~30-120 KiB) fits
+        # comfortably within Prosody's c2s_stanza_size_limit even with the
+        # server default (256 KiB).
         try:
-            img = img.resize((480, 480), Image.Resampling.LANCZOS)
+            img = img.resize((256, 256), Image.Resampling.LANCZOS)
         except AttributeError:
             # Pillow < 9.1 uses the Image.LANCZOS constant.
-            img = img.resize((480, 480), Image.LANCZOS)
+            img = img.resize((256, 256), Image.LANCZOS)
 
         png_buffer = io.BytesIO()
         img.save(png_buffer, format="PNG", optimize=True)
@@ -1992,6 +2089,18 @@ class XMPPAdapter(BasePlatformAdapter):
                 thread_id=None,
             )
 
+            # Fix 2026-10-22: Hermes >=13:24 rejects any non-whatsapp
+            # MessageEvent.metadata (session_envelope._native_metadata ->
+            # invalid_params). The XMPP metadata (encrypted/media_url/media_path)
+            # is not consumed by the Hermes core — log it and send an empty
+            # dict to pass native admission validation.
+            if encrypted or media_path or url:
+                logger.info(
+                    "XMPP: message metadata (not passed to gateway): encrypted=%s media_url=%s media_path=%s",
+                    encrypted,
+                    _log_safe_url(url) if url else None,
+                    media_path,
+                )
             event = MessageEvent(
                 text=display_text,
                 message_type=msg_type,
@@ -1999,14 +2108,7 @@ class XMPPAdapter(BasePlatformAdapter):
                 raw_message=msg,
                 media_urls=media_urls,
                 media_types=media_types,
-                metadata={
-                    "encrypted": encrypted,
-                    # The raw media URL can carry the aesgcm:// decryption key in
-                    # its fragment; keep the key out of the agent context and the
-                    # session store by recording a redacted form here.
-                    "media_url": _log_safe_url(url) if url else url,
-                    "media_path": media_path,
-                },
+                metadata={},
             )
 
             logger.debug("XMPP: about to handle_message event text=%r type=%s", display_text, msg_type)
